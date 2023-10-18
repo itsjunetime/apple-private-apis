@@ -63,8 +63,8 @@ pub fn compute_m1<D: Digest>(
 // M2 = H(A, M1, K)
 pub fn compute_m2<D: Digest>(a_pub: &[u8], m1: &Output<D>, key: &[u8]) -> Output<D> {
     let mut d = D::new();
-    d.update(&a_pub);
-    d.update(&m1);
-    d.update(&key);
+    d.update(a_pub);
+    d.update(m1);
+    d.update(key);
     d.finalize()
 }

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 pub mod adi_proxy;
 pub mod anisette_headers_provider;
 pub mod store_services_core;
+pub mod aoskit_emu;
 
 #[cfg(target_os = "macos")]
 pub mod aos_kit;

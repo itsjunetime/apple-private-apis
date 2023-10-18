@@ -3,9 +3,12 @@ mod posix_macos;
 #[cfg(target_family = "windows")]
 mod posix_windows;
 
-use crate::adi_proxy::{
-    ADIError, ADIProxy, ConfigurableADIProxy, RequestOTPData, StartProvisioningData,
-    SynchronizeData,
+use crate::{
+    adi_proxy::{
+        ADIError, ADIProxy, ConfigurableADIProxy, RequestOTPData, StartProvisioningData,
+        SynchronizeData,
+    },
+    aoskit_emu::{MachHook, set_android_id_stub, set_android_prov_path_stub}
 };
 
 use android_loader::android_library::AndroidLibrary;
@@ -14,12 +17,10 @@ use android_loader::{hook_manager, sysv64};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::ffi::{c_char, CString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::mem::transmute;
 
-pub struct StoreServicesCoreADIProxy<'lt> {
-    #[allow(dead_code)]
-    store_services_core: AndroidLibrary<'lt>,
-
+pub struct StoreServicesCoreADIProxy {
     local_user_uuid: String,
     device_identifier: String,
 
@@ -65,114 +66,157 @@ pub struct StoreServicesCoreADIProxy<'lt> {
     ),
 }
 
-impl StoreServicesCoreADIProxy<'_> {
-    pub fn new<'lt>(library_path: &PathBuf) -> Result<StoreServicesCoreADIProxy<'lt>> {
+impl StoreServicesCoreADIProxy {
+    pub fn new(library_path: &PathBuf) -> Result<StoreServicesCoreADIProxy> {
         Self::with_custom_provisioning_path(library_path, library_path)
     }
 
-    pub fn with_custom_provisioning_path<'lt>(library_path: &PathBuf, provisioning_path: &PathBuf) -> Result<StoreServicesCoreADIProxy<'lt>> {
-        // Should be safe if the library is correct.
-        unsafe {
-            LoaderHelpers::setup_hooks();
+    pub fn with_custom_provisioning_path(library_path: &PathBuf, provisioning_path: &Path) -> Result<StoreServicesCoreADIProxy> {
+        LoaderHelpers::setup_hooks();
 
-            if !library_path.exists() {
-                std::fs::create_dir(library_path)?;
-                return Err(ADIStoreSericesCoreErr::MissingLibraries.into());
-            }
+        if !library_path.exists() {
+            std::fs::create_dir(library_path)?;
+            return Err(ADIStoreSericesCoreErr::MissingLibraries.into());
+        }
 
-            let library_path = library_path.canonicalize()?;
+        let library_path = library_path.canonicalize()?;
 
-            #[cfg(target_arch = "x86_64")]
-            const ARCH: &str = "x86_64";
-            #[cfg(target_arch = "x86")]
-            const ARCH: &str = "x86";
-            #[cfg(target_arch = "arm")]
-            const ARCH: &str = "armeabi-v7a";
-            #[cfg(target_arch = "aarch64")]
-            const ARCH: &str = "arm64-v8a";
+        #[cfg(target_arch = "x86_64")]
+        const ARCH: &str = "x86_64";
+        #[cfg(target_arch = "x86")]
+        const ARCH: &str = "x86";
+        #[cfg(target_arch = "arm")]
+        const ARCH: &str = "armeabi-v7a";
+        #[cfg(target_arch = "aarch64")]
+        const ARCH: &str = "arm64-v8a";
 
-            let native_library_path = library_path.join("lib").join(ARCH);
+        let native_library_path = library_path.join("lib").join(ARCH);
 
-            let path = native_library_path.join("libstoreservicescore.so");
-            let path = path.to_str().ok_or(ADIStoreSericesCoreErr::Misc)?;
-            let store_services_core = AndroidLibrary::load(path)?;
+        let path = native_library_path.join("libstoreservicescore.so");
+        let path = path.to_str().ok_or(ADIStoreSericesCoreErr::Misc)?;
+        let store_services_core = AndroidLibrary::load(path)?;
 
-            let adi_load_library_with_path: sysv64_type!(fn(path: *const u8) -> i32) =
-                std::mem::transmute(
+        let adi_load_library_with_path: sysv64_type!(fn(path: *const u8) -> i32) =
+            unsafe {
+                transmute(
                     store_services_core
                         .get_symbol("kq56gsgHG6")
                         .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?,
-                );
-
-            let path = CString::new(
-                native_library_path
-                    .to_str()
-                    .ok_or(ADIStoreSericesCoreErr::Misc)?,
-            )
-            .unwrap();
-            assert_eq!((adi_load_library_with_path)(path.as_ptr() as *const u8), 0);
-
-            let adi_set_android_id = store_services_core
-                .get_symbol("Sph98paBcz")
-                .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
-            let adi_set_provisioning_path = store_services_core
-                .get_symbol("nf92ngaK92")
-                .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
-
-            let adi_provisioning_erase = store_services_core
-                .get_symbol("p435tmhbla")
-                .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
-            let adi_synchronize = store_services_core
-                .get_symbol("tn46gtiuhw")
-                .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
-            let adi_provisioning_destroy = store_services_core
-                .get_symbol("fy34trz2st")
-                .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
-            let adi_provisioning_end = store_services_core
-                .get_symbol("uv5t6nhkui")
-                .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
-            let adi_provisioning_start = store_services_core
-                .get_symbol("rsegvyrt87")
-                .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
-            let adi_get_login_code = store_services_core
-                .get_symbol("aslgmuibau")
-                .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
-            let adi_dispose = store_services_core
-                .get_symbol("jk24uiwqrg")
-                .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
-            let adi_otp_request = store_services_core
-                .get_symbol("qi864985u0")
-                .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
-
-            let mut proxy = StoreServicesCoreADIProxy {
-                store_services_core,
-
-                local_user_uuid: String::new(),
-                device_identifier: String::new(),
-
-                adi_set_android_id: std::mem::transmute(adi_set_android_id),
-                adi_set_provisioning_path: std::mem::transmute(adi_set_provisioning_path),
-
-                adi_provisioning_erase: std::mem::transmute(adi_provisioning_erase),
-                adi_synchronize: std::mem::transmute(adi_synchronize),
-                adi_provisioning_destroy: std::mem::transmute(adi_provisioning_destroy),
-                adi_provisioning_end: std::mem::transmute(adi_provisioning_end),
-                adi_provisioning_start: std::mem::transmute(adi_provisioning_start),
-                adi_get_login_code: std::mem::transmute(adi_get_login_code),
-                adi_dispose: std::mem::transmute(adi_dispose),
-                adi_otp_request: std::mem::transmute(adi_otp_request),
+                )
             };
 
-            proxy.set_provisioning_path(
-                provisioning_path.to_str().ok_or(ADIStoreSericesCoreErr::Misc)?,
-            )?;
+        let path = CString::new(
+            native_library_path
+                .to_str()
+                .ok_or(ADIStoreSericesCoreErr::Misc)?,
+        )
+        .unwrap();
+        assert_eq!((adi_load_library_with_path)(path.as_ptr() as *const u8), 0);
 
-            Ok(proxy)
-        }
+        let adi_set_android_id = store_services_core
+            .get_symbol("Sph98paBcz")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_set_provisioning_path = store_services_core
+            .get_symbol("nf92ngaK92")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+
+        let adi_provisioning_erase = store_services_core
+            .get_symbol("p435tmhbla")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_synchronize = store_services_core
+            .get_symbol("tn46gtiuhw")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_provisioning_destroy = store_services_core
+            .get_symbol("fy34trz2st")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_provisioning_end = store_services_core
+            .get_symbol("uv5t6nhkui")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_provisioning_start = store_services_core
+            .get_symbol("rsegvyrt87")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_get_login_code = store_services_core
+            .get_symbol("aslgmuibau")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_dispose = store_services_core
+            .get_symbol("jk24uiwqrg")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_otp_request = store_services_core
+            .get_symbol("qi864985u0")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+
+        let mut proxy = unsafe { StoreServicesCoreADIProxy {
+            local_user_uuid: String::new(),
+            device_identifier: String::new(),
+
+            adi_set_android_id: transmute(adi_set_android_id),
+            adi_set_provisioning_path: transmute(adi_set_provisioning_path),
+
+            adi_provisioning_erase: transmute(adi_provisioning_erase),
+            adi_synchronize: transmute(adi_synchronize),
+            adi_provisioning_destroy: transmute(adi_provisioning_destroy),
+            adi_provisioning_end: transmute(adi_provisioning_end),
+            adi_provisioning_start: transmute(adi_provisioning_start),
+            adi_get_login_code: transmute(adi_get_login_code),
+            adi_dispose: transmute(adi_dispose),
+            adi_otp_request: transmute(adi_otp_request),
+        }};
+
+        proxy.set_provisioning_path(
+            provisioning_path.to_str().ok_or(ADIStoreSericesCoreErr::Misc)?,
+        )?;
+
+        Ok(proxy)
+    }
+
+    pub fn from_macos_aoskit<P: AsRef<Path>>(path: &P) -> Result<StoreServicesCoreADIProxy> {
+        let mut hook = MachHook::new(path, None)?;
+
+        hook.hook_fn("_arc4random", arc4random as *const ())?;
+        hook.hook_fn("_close", libc::close as *const ())?;
+        hook.hook_fn("_free", libc::free as *const ())?;
+        hook.hook_fn("_gettimeofday", libc::gettimeofday as *const ())?;
+        hook.hook_fn("_malloc", libc::malloc as *const ())?;
+        hook.hook_fn("_open", libc::open as *const ())?;
+        hook.hook_fn("_dlsym", MachHook::dlsym as *const ())?;
+        hook.hook_fn("_dlopen", MachHook::dlopen as *const ())?;
+
+        // The symbols that may not be present, so we're ok if trying to replace them returns an error
+        _ = hook.hook_fn("_read", libc::read as *const ());
+        _ = hook.hook_fn("_strncpy", libc::strncpy as *const ());
+        _ = hook.hook_fn("_umask", libc::umask as *const ());
+        _ = hook.hook_fn("_write", libc::write as *const ());
+        _ = hook.hook_fn("_mkdir", libc::mkdir as *const ());
+        _ = hook.hook_fn("_lstat", libc::lstat as *const ());
+        _ = hook.hook_fn("_fstat", libc::fstat as *const ());
+        _ = hook.hook_fn("_ftruncate", libc::ftruncate as *const ());
+        _ = hook.hook_fn("_chmod", libc::chmod as *const ());
+        _ = hook.hook_fn("___system_property_get", __system_property_get as *const ());
+        _ = hook.hook_fn("___errno", __errno_location as *const ());
+        _ = hook.hook_fn("_dlclose", MachHook::dlclose as *const ());
+
+        let provider = unsafe {
+            StoreServicesCoreADIProxy {
+                local_user_uuid: String::new(),
+                device_identifier: String::new(),
+                adi_set_android_id: set_android_id_stub,
+                adi_set_provisioning_path: set_android_prov_path_stub,
+                adi_provisioning_erase: transmute(hook.get_symbol_ptr("_p435tmhbla").unwrap()),
+                adi_synchronize: transmute(hook.get_symbol_ptr("_tn46gtiuhw").unwrap()),
+                adi_provisioning_destroy: transmute(hook.get_symbol_ptr("_fy34trz2st").unwrap()),
+                adi_provisioning_end: transmute(hook.get_symbol_ptr("_uv5t6nhkui").unwrap()),
+                adi_provisioning_start: transmute(hook.get_symbol_ptr("_rsegvyrt87").unwrap()),
+                adi_get_login_code: transmute(hook.get_symbol_ptr("_aslgmuibau").unwrap()),
+                adi_dispose: transmute(hook.get_symbol_ptr("_jk24uiwqrg").unwrap()),
+                adi_otp_request: transmute(hook.get_symbol_ptr("_qi864985u0").unwrap()),
+            }
+        };
+
+        Ok(provider)
     }
 }
 
-impl ADIProxy for StoreServicesCoreADIProxy<'_> {
+impl ADIProxy for StoreServicesCoreADIProxy {
     fn erase_provisioning(&mut self, ds_id: i64) -> Result<(), ADIError> {
         match (self.adi_provisioning_erase)(ds_id) {
             0 => Ok(()),
@@ -181,38 +225,40 @@ impl ADIProxy for StoreServicesCoreADIProxy<'_> {
     }
 
     fn synchronize(&mut self, ds_id: i64, sim: &[u8]) -> Result<SynchronizeData, ADIError> {
-        unsafe {
-            let sim_size = sim.len() as u32;
-            let sim_ptr = sim.as_ptr();
+        let sim_size = sim.len() as u32;
+        let sim_ptr = sim.as_ptr();
 
-            let mut mid_size: u32 = 0;
-            let mut mid_ptr: *const u8 = std::ptr::null();
-            let mut srm_size: u32 = 0;
-            let mut srm_ptr: *const u8 = std::ptr::null();
+        let mut mid_size: u32 = 0;
+        let mut mid_ptr: *const u8 = std::ptr::null();
+        let mut srm_size: u32 = 0;
+        let mut srm_ptr: *const u8 = std::ptr::null();
 
-            match (self.adi_synchronize)(
-                ds_id,
-                sim_ptr,
-                sim_size,
-                &mut mid_ptr,
-                &mut mid_size,
-                &mut srm_ptr,
-                &mut srm_size,
-            ) {
-                0 => {
-                    let mut mid = vec![0; mid_size as usize];
-                    let mut srm = vec![0; srm_size as usize];
+        match (self.adi_synchronize)(
+            ds_id,
+            sim_ptr,
+            sim_size,
+            &mut mid_ptr,
+            &mut mid_size,
+            &mut srm_ptr,
+            &mut srm_size,
+        ) {
+            0 => {
+                let mut mid = vec![0; mid_size as usize];
+                let mut srm = vec![0; srm_size as usize];
 
+                // SAFETY: This is safe as long as the library returned initialized data at these
+                // locations - because the function returned 0, we are trusting that it did.
+                unsafe {
                     mid.copy_from_slice(std::slice::from_raw_parts(mid_ptr, mid_size as usize));
                     srm.copy_from_slice(std::slice::from_raw_parts(srm_ptr, srm_size as usize));
-
-                    (self.adi_dispose)(mid_ptr);
-                    (self.adi_dispose)(srm_ptr);
-
-                    Ok(SynchronizeData { mid, srm })
                 }
-                err => Err(ADIError::resolve(err)),
+
+                (self.adi_dispose)(mid_ptr);
+                (self.adi_dispose)(srm_ptr);
+
+                Ok(SynchronizeData { mid, srm })
             }
+            err => Err(ADIError::resolve(err)),
         }
     }
 
@@ -241,34 +287,36 @@ impl ADIProxy for StoreServicesCoreADIProxy<'_> {
         ds_id: i64,
         spim: &[u8],
     ) -> Result<StartProvisioningData, ADIError> {
-        unsafe {
-            let spim_size = spim.len() as u32;
-            let spim_ptr = spim.as_ptr();
+        let spim_size = spim.len() as u32;
+        let spim_ptr = spim.as_ptr();
 
-            let mut cpim_size: u32 = 0;
-            let mut cpim_ptr: *const u8 = std::ptr::null();
+        let mut cpim_size: u32 = 0;
+        let mut cpim_ptr: *const u8 = std::ptr::null();
 
-            let mut session: u32 = 0;
+        let mut session: u32 = 0;
 
-            match (self.adi_provisioning_start)(
-                ds_id,
-                spim_ptr,
-                spim_size,
-                &mut cpim_ptr,
-                &mut cpim_size,
-                &mut session,
-            ) {
-                0 => {
-                    let mut cpim = vec![0; cpim_size as usize];
+        match (self.adi_provisioning_start)(
+            ds_id,
+            spim_ptr,
+            spim_size,
+            &mut cpim_ptr,
+            &mut cpim_size,
+            &mut session,
+        ) {
+            0 => {
+                let mut cpim = vec![0; cpim_size as usize];
 
+                // SAFETY: This is safe as long as the library correctly initializes the data at
+                // this locations - because it returned 0, we are trusting that it did.
+                unsafe {
                     cpim.copy_from_slice(std::slice::from_raw_parts(cpim_ptr, cpim_size as usize));
-
-                    (self.adi_dispose)(cpim_ptr);
-
-                    Ok(StartProvisioningData { cpim, session })
                 }
-                err => Err(ADIError::resolve(err)),
+
+                (self.adi_dispose)(cpim_ptr);
+
+                Ok(StartProvisioningData { cpim, session })
             }
+            err => Err(ADIError::resolve(err)),
         }
     }
 
@@ -277,33 +325,35 @@ impl ADIProxy for StoreServicesCoreADIProxy<'_> {
     }
 
     fn request_otp(&self, ds_id: i64) -> Result<RequestOTPData, ADIError> {
-        unsafe {
-            let mut mid_size: u32 = 0;
-            let mut mid_ptr: *const u8 = std::ptr::null();
-            let mut otp_size: u32 = 0;
-            let mut otp_ptr: *const u8 = std::ptr::null();
+        let mut mid_size: u32 = 0;
+        let mut mid_ptr: *const u8 = std::ptr::null();
+        let mut otp_size: u32 = 0;
+        let mut otp_ptr: *const u8 = std::ptr::null();
 
-            match (self.adi_otp_request)(
-                ds_id,
-                &mut mid_ptr,
-                &mut mid_size,
-                &mut otp_ptr,
-                &mut otp_size,
-            ) {
-                0 => {
-                    let mut mid = vec![0; mid_size as usize];
-                    let mut otp = vec![0; otp_size as usize];
+        match (self.adi_otp_request)(
+            ds_id,
+            &mut mid_ptr,
+            &mut mid_size,
+            &mut otp_ptr,
+            &mut otp_size,
+        ) {
+            0 => {
+                let mut mid = vec![0; mid_size as usize];
+                let mut otp = vec![0; otp_size as usize];
 
+                // SAFETY: This is safe as long as the library returned initialized data at these
+                // locations - because the function returned 0, we are trusting that it did.
+                unsafe {
                     mid.copy_from_slice(std::slice::from_raw_parts(mid_ptr, mid_size as usize));
                     otp.copy_from_slice(std::slice::from_raw_parts(otp_ptr, otp_size as usize));
-
-                    (self.adi_dispose)(mid_ptr);
-                    (self.adi_dispose)(otp_ptr);
-
-                    Ok(RequestOTPData { mid, otp })
                 }
-                err => Err(ADIError::resolve(err)),
+
+                (self.adi_dispose)(mid_ptr);
+                (self.adi_dispose)(otp_ptr);
+
+                Ok(RequestOTPData { mid, otp })
             }
+            err => Err(ADIError::resolve(err)),
         }
     }
 
@@ -317,20 +367,20 @@ impl ADIProxy for StoreServicesCoreADIProxy<'_> {
         Ok(())
     }
 
-    fn get_local_user_uuid(&self) -> String {
-        self.local_user_uuid.clone()
+    fn get_local_user_uuid(&self) -> &str {
+        self.local_user_uuid.as_str()
     }
 
-    fn get_device_identifier(&self) -> String {
-        self.device_identifier.clone()
+    fn get_device_identifier(&self) -> &str {
+        self.device_identifier.as_str()
     }
 
-    fn get_serial_number(&self) -> String {
-        "0".to_string()
+    fn get_serial_number(&self) -> &str {
+        "0"
     }
 }
 
-impl ConfigurableADIProxy for StoreServicesCoreADIProxy<'_> {
+impl ConfigurableADIProxy for StoreServicesCoreADIProxy {
     fn set_identifier(&mut self, identifier: &str) -> Result<(), ADIError> {
         match (self.adi_set_android_id)(identifier.as_ptr(), identifier.len() as u32) {
             0 => Ok(()),

@@ -23,8 +23,6 @@ pub fn sign_app(
     debug!("Done adding dummy bundle IDs!");
 
     let (cert, key) = parse_pfx_data(certificate, certificate_password)?;
-    drop(certificate);
-    drop(certificate_password);
 
     let mut settings = SigningSettings::default();
     settings.set_signing_key(key.as_key_info_signer(), cert);

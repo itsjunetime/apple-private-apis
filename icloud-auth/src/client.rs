@@ -177,7 +177,7 @@ impl AppleAccount {
         println!("sk: {:#?}", sk);
         println!("c: {:#?}", c);
 
-        let checksum = Self::create_checksum(&sk.to_vec(), dsid, app_name);
+        let checksum = Self::create_checksum(sk, dsid, app_name);
 
         let mut gsa_headers = HeaderMap::new();
         gsa_headers.insert(
@@ -234,8 +234,8 @@ impl AppleAccount {
         todo!()
     }
 
-    fn create_checksum(session_key: &Vec<u8>, dsid: &str, app_name: &str) -> Vec<u8> {
-        Hmac::<Sha256>::new_from_slice(&session_key)
+    fn create_checksum(session_key: &[u8], dsid: &str, app_name: &str) -> Vec<u8> {
+        Hmac::<Sha256>::new_from_slice(session_key)
             .unwrap()
             .chain_update("apptokens".as_bytes())
             .chain_update(dsid.as_bytes())
@@ -354,7 +354,7 @@ impl AppleAccount {
         let c = res.get("c").unwrap().as_string().unwrap();
 
         let mut password_hasher = sha2::Sha256::new();
-        password_hasher.update(&password.as_bytes());
+        password_hasher.update(password.as_bytes());
         let hashed_password = password_hasher.finalize();
 
         let mut password_buf = [0u8; 32];
@@ -366,7 +366,7 @@ impl AppleAccount {
         );
 
         let verifier: SrpClientVerifier<Sha256> = srp_client
-            .process_reply(&a, &username.as_bytes(), &password_buf, salt, b_pub)
+            .process_reply(&a, username.as_bytes(), &password_buf, salt, b_pub)
             .unwrap();
 
         let m = verifier.proof();
@@ -402,7 +402,7 @@ impl AppleAccount {
         }
         println!("{:?}", res);
         let m2 = res.get("M2").unwrap().as_data().unwrap();
-        verifier.verify_server(&m2).unwrap();
+        verifier.verify_server(m2).unwrap();
 
         let spd = res.get("spd").unwrap().as_data().unwrap();
         let decrypted_spd = Self::decrypt_cbc(&verifier, spd);
@@ -411,16 +411,14 @@ impl AppleAccount {
         let status = res.get("Status").unwrap().as_dictionary().unwrap();
 
         let needs2fa = match status.get("au") {
-            Some(plist::Value::String(s)) => {
-                if s == "trustedDeviceSecondaryAuth" {
-                    println!("Trusted device authentication required");
-                    true
-                } else {
-                    println!("Unknown auth value {}", s);
-                    // PHONE AUTH WILL CAUSE ERRORS!
-                    false
-                }
-            }
+            Some(plist::Value::String(s)) => if s == "trustedDeviceSecondaryAuth" {
+                println!("Trusted device authentication required");
+                true
+            } else {
+                println!("Unknown auth value {}", s);
+                // PHONE AUTH WILL CAUSE ERRORS!
+                false
+            },
             _ => false,
         };
 
@@ -434,7 +432,7 @@ impl AppleAccount {
     }
 
     fn create_session_key(usr: &SrpClientVerifier<Sha256>, name: &str) -> Vec<u8> {
-        Hmac::<Sha256>::new_from_slice(&usr.key())
+        Hmac::<Sha256>::new_from_slice(usr.key())
             .unwrap()
             .chain_update(name.as_bytes())
             .finalize()
@@ -449,7 +447,7 @@ impl AppleAccount {
 
         cbc::Decryptor::<aes::Aes256>::new_from_slices(&extra_data_key, extra_data_iv)
             .unwrap()
-            .decrypt_padded_vec_mut::<Pkcs7>(&data)
+            .decrypt_padded_vec_mut::<Pkcs7>(data)
             .unwrap()
     }
 
@@ -462,12 +460,13 @@ impl AppleAccount {
             .headers(headers)
             .send();
 
-        if !res.as_ref().unwrap().status().is_success() {
+        if !res.as_ref().map_or(false, |r| r.status().is_success()) {
             return Err(Error::AuthSrp);
         }
 
-        return Ok(LoginResponse::Needs2FAVerification());
+        Ok(LoginResponse::Needs2FAVerification())
     }
+
     pub fn verify_2fa(&self, code: String) -> Result<LoginResponse, Error> {
         let headers = self.build_2fa_headers();
         println!("Recieved code: {}", code);
@@ -495,7 +494,7 @@ impl AppleAccount {
     fn check_error(res: &plist::Dictionary) -> Result<(), Error> {
         let res = match res.get("Status") {
             Some(plist::Value::Dictionary(d)) => d,
-            _ => &res,
+            _ => res,
         };
 
         if res.get("ec").unwrap().as_signed_integer().unwrap() != 0 {

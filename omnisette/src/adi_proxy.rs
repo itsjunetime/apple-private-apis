@@ -108,9 +108,9 @@ pub trait ADIProxy {
     fn set_local_user_uuid(&mut self, local_user_uuid: String);
     fn set_device_identifier(&mut self, device_identifier: String) -> Result<()>;
 
-    fn get_local_user_uuid(&self) -> String;
-    fn get_device_identifier(&self) -> String;
-    fn get_serial_number(&self) -> String;
+    fn get_local_user_uuid(&self) -> &str;
+    fn get_device_identifier(&self) -> &str;
+    fn get_serial_number(&self) -> &str;
 }
 
 pub trait ConfigurableADIProxy: ADIProxy {
@@ -168,15 +168,15 @@ impl dyn ADIProxy {
         );
         headers.insert(
             "X-Mme-Device-Id",
-            HeaderValue::from_str(self.get_device_identifier().as_str())?,
+            HeaderValue::from_str(self.get_device_identifier())?,
         );
         headers.insert(
             "X-Apple-I-MD-LU",
-            HeaderValue::from_str(self.get_local_user_uuid().as_str())?,
+            HeaderValue::from_str(self.get_local_user_uuid())?,
         );
         headers.insert(
             "X-Apple-I-SRL-NO",
-            HeaderValue::from_str(self.get_serial_number().as_str())?,
+            HeaderValue::from_str(self.get_serial_number())?,
         );
 
         debug!("Headers sent: {headers:?}");
@@ -358,11 +358,11 @@ impl<ProxyType: ADIProxy + 'static> AnisetteHeadersProvider
         headers.insert("X-Apple-I-MD-RINFO".to_string(), "17106176".to_string());
         headers.insert(
             "X-Apple-I-MD-LU".to_string(),
-            adi_proxy.get_local_user_uuid(),
+            adi_proxy.get_local_user_uuid().to_string(),
         );
         headers.insert(
             "X-Apple-I-SRL-NO".to_string(),
-            adi_proxy.get_serial_number(),
+            adi_proxy.get_serial_number().to_string(),
         );
         headers.insert(
             "X-Mme-Client-Info".to_string(),
@@ -370,7 +370,7 @@ impl<ProxyType: ADIProxy + 'static> AnisetteHeadersProvider
         );
         headers.insert(
             "X-Mme-Device-Id".to_string(),
-            adi_proxy.get_device_identifier(),
+            adi_proxy.get_device_identifier().to_string(),
         );
 
         Ok(headers)
