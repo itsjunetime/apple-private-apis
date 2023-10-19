@@ -169,8 +169,8 @@ impl StoreServicesCoreADIProxy {
         Ok(proxy)
     }
 
-    pub fn from_macos_aoskit<P: AsRef<Path>>(path: &P) -> Result<StoreServicesCoreADIProxy> {
-        let mut hook = MachHook::new(path, None)?;
+    pub fn from_macos_aoskit<P: AsRef<Path>>(path: P) -> Result<StoreServicesCoreADIProxy> {
+        let mut hook = MachHook::new(&path, None)?;
 
         hook.hook_fn("_arc4random", arc4random as *const ())?;
         hook.hook_fn("_close", libc::close as *const ())?;
