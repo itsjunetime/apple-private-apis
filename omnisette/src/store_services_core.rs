@@ -21,6 +21,11 @@ use std::path::{Path, PathBuf};
 use std::mem::transmute;
 
 pub struct StoreServicesCoreADIProxy {
+	// we need to keep the library around 'cause every implementation so far memmaps the data,
+	// so we need to make sure it's not dropped
+	#[allow(dead_code)]
+	library: Box<dyn std::any::Any>,
+
     local_user_uuid: String,
     device_identifier: String,
 
@@ -146,6 +151,7 @@ impl StoreServicesCoreADIProxy {
             .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
 
         let mut proxy = unsafe { StoreServicesCoreADIProxy {
+			library: Box::new(store_services_core),
             local_user_uuid: String::new(),
             device_identifier: String::new(),
 
@@ -195,20 +201,32 @@ impl StoreServicesCoreADIProxy {
         _ = hook.hook_fn("___errno", __errno_location as *const ());
         _ = hook.hook_fn("_dlclose", MachHook::dlclose as *const ());
 
+        let adi_provisioning_erase = hook.get_symbol_ptr("_p435tmhbla").unwrap();
+        let adi_synchronize = hook.get_symbol_ptr("_tn46gtiuhw").unwrap();
+        let adi_provisioning_destroy = hook.get_symbol_ptr("_fy34trz2st").unwrap();
+        let adi_provisioning_end = hook.get_symbol_ptr("_uv5t6nhkui").unwrap();
+        let adi_provisioning_start = hook.get_symbol_ptr("_rsegvyrt87").unwrap();
+        let adi_get_login_code = hook.get_symbol_ptr("_aslgmuibau").unwrap();
+        let adi_dispose = hook.get_symbol_ptr("_jk24uiwqrg").unwrap();
+        let adi_otp_request = hook.get_symbol_ptr("_qi864985u0").unwrap();
+
+		println!("erase: {adi_provisioning_erase:?}");
+
         let provider = unsafe {
             StoreServicesCoreADIProxy {
+				library: Box::new(hook),
                 local_user_uuid: String::new(),
                 device_identifier: String::new(),
                 adi_set_android_id: set_android_id_stub,
                 adi_set_provisioning_path: set_android_prov_path_stub,
-                adi_provisioning_erase: transmute(hook.get_symbol_ptr("_p435tmhbla").unwrap()),
-                adi_synchronize: transmute(hook.get_symbol_ptr("_tn46gtiuhw").unwrap()),
-                adi_provisioning_destroy: transmute(hook.get_symbol_ptr("_fy34trz2st").unwrap()),
-                adi_provisioning_end: transmute(hook.get_symbol_ptr("_uv5t6nhkui").unwrap()),
-                adi_provisioning_start: transmute(hook.get_symbol_ptr("_rsegvyrt87").unwrap()),
-                adi_get_login_code: transmute(hook.get_symbol_ptr("_aslgmuibau").unwrap()),
-                adi_dispose: transmute(hook.get_symbol_ptr("_jk24uiwqrg").unwrap()),
-                adi_otp_request: transmute(hook.get_symbol_ptr("_qi864985u0").unwrap()),
+                adi_provisioning_erase: transmute(adi_provisioning_erase),
+                adi_synchronize: transmute(adi_synchronize),
+                adi_provisioning_destroy: transmute(adi_provisioning_destroy),
+                adi_provisioning_end: transmute(adi_provisioning_end),
+                adi_provisioning_start: transmute(adi_provisioning_start),
+                adi_get_login_code: transmute(adi_get_login_code),
+                adi_dispose: transmute(adi_dispose),
+                adi_otp_request: transmute(adi_otp_request),
             }
         };
 

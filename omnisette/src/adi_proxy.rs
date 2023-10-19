@@ -282,6 +282,30 @@ impl dyn ADIProxy {
     }
 }
 
+#[derive(Debug)]
+pub enum NewADIProxyErr {
+	IDFileUnopenable(String, std::io::Error),
+	IDFileNoMetadata(std::io::Error),
+	IDFileReadErr(std::io::Error),
+	IDFileWriteErr(std::io::Error),
+	FailedToSetDeviceID
+}
+
+impl Display for NewADIProxyErr {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		use NewADIProxyErr::*;
+		match self {
+			IDFileUnopenable(s, e) => write!(f, "The ID file specified at {s} was unopenable: {e}"),
+			IDFileNoMetadata(e) => write!(f, "Could not retrieve metadata of ID file: {e}"),
+			IDFileReadErr(e) => write!(f, "Error when reading ID from ID file: {e}"),
+			IDFileWriteErr(e) => write!(f, "Error when writing to ID file: {e}"),
+			FailedToSetDeviceID => write!(f, "Failed to set device identifier")
+		}
+	}
+}
+
+impl std::error::Error for NewADIProxyErr {}
+
 pub struct ADIProxyAnisetteProvider<ProxyType: ADIProxy + 'static> {
     adi_proxy: ProxyType,
 }
@@ -295,19 +319,20 @@ impl<ProxyType: ADIProxy + 'static> ADIProxyAnisetteProvider<ProxyType> {
     pub fn new(
         mut adi_proxy: ProxyType,
         configuration_path: PathBuf,
-    ) -> Result<ADIProxyAnisetteProvider<ProxyType>> {
+    ) -> Result<ADIProxyAnisetteProvider<ProxyType>, NewADIProxyErr> {
         let identifier_file_path = configuration_path.join("identifier");
         let mut identifier_file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(identifier_file_path)?;
+            .open(&identifier_file_path)
+			.map_err(|e| NewADIProxyErr::IDFileUnopenable(format!("{identifier_file_path:?}"), e))?;
         let mut identifier = [0u8; IDENTIFIER_LENGTH];
-        if identifier_file.metadata()?.len() == IDENTIFIER_LENGTH as u64 {
-            identifier_file.read_exact(&mut identifier)?;
+        if identifier_file.metadata().map_err(NewADIProxyErr::IDFileNoMetadata)?.len() == IDENTIFIER_LENGTH as u64 {
+            identifier_file.read_exact(&mut identifier).map_err(NewADIProxyErr::IDFileReadErr)?;
         } else {
             rand::thread_rng().fill_bytes(&mut identifier);
-            identifier_file.write_all(&identifier)?;
+            identifier_file.write_all(&identifier).map_err(NewADIProxyErr::IDFileWriteErr)?;
         }
 
         let mut local_user_uuid_hasher = Sha256::new();
@@ -317,7 +342,7 @@ impl<ProxyType: ADIProxy + 'static> ADIProxyAnisetteProvider<ProxyType> {
             uuid::Uuid::from_bytes(identifier)
                 .to_string()
                 .to_uppercase(),
-        )?; // UUID, uppercase
+        ).map_err(|_| NewADIProxyErr::FailedToSetDeviceID)?; // UUID, uppercase
         adi_proxy
             .set_local_user_uuid(hex::encode(local_user_uuid_hasher.finalize()).to_uppercase()); // 64 uppercase character hex
 

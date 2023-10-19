@@ -1,5 +1,4 @@
 use std::{
-    fs::read,
     io::{Seek, SeekFrom, Cursor},
     rc::Rc,
     os::unix::fs::MetadataExt,
@@ -11,7 +10,7 @@ use mach_object::{
     CPU_TYPE_ARM, CPU_TYPE_ARM64,
     CPU_TYPE_POWERPC, CPU_TYPE_POWERPC64
 };
-use memmap::{MmapMut, MmapOptions};
+use memmap2::{MmapMut, MmapOptions};
 use android_loader::sysv64;
 
 #[derive(Debug)]
@@ -48,6 +47,7 @@ pub enum NewMachHookErr {
     FileUnreadable(std::io::Error),
     MmapFailed(std::io::Error),
     OFileParseFailed(mach_object::MachError),
+	ProtectErr(region::Error),
     NoFileMatchedArch,
     NonMachOrFatFile,
     NoSymtabInFile,
@@ -60,6 +60,7 @@ impl std::fmt::Display for NewMachHookErr {
             FileUnreadable(e) => write!(f, "Input file is unreadable: {e}"),
             MmapFailed(e) => write!(f, "Mmap'ing file data into memory failed: {e}"),
             OFileParseFailed(e) => write!(f, "Couldn't parse Mach-o file: {e}"),
+			ProtectErr(e) => write!(f, "Couldn't protection mmap'ed region: {e}"),
             NoFileMatchedArch => write!(f, "Input file had no sections that matched the arch of this device"),
             NonMachOrFatFile => write!(f, "This is a mach-o file, but something like an ar file which we can't process"),
             NoSymtabInFile => write!(f, "The input file somehow has no Symtab load command")
@@ -82,19 +83,28 @@ impl std::error::Error for SymbolNotFound<'_> {}
 
 impl MachHook {
     pub fn new<P: AsRef<Path> + Clone>(lib_path: P, loc: Option<(u64, u64)>) -> Result<Self, NewMachHookErr> {
-        let file = read(&lib_path).map_err(NewMachHookErr::FileUnreadable)?;
-        let data = loc.map(|(start, end)| &file[start as usize..end as usize]).unwrap_or(&file);
+		let file = std::fs::OpenOptions::new()
+			.read(true)
+			.write(true)
+			.open(&lib_path)
+			.map_err(NewMachHookErr::FileUnreadable)?;
         let size = loc.map_or_else(
             || std::fs::metadata(&lib_path).map_or(0, |m| m.size()),
             |(start, end)| end - start
         ) as usize;
 
-        let mut mmap = MmapOptions::new().len(size).map_anon().map_err(NewMachHookErr::MmapFailed)?;
-        mmap[..].copy_from_slice(data);
+        let mmap = unsafe {
+			MmapOptions::new()
+				.offset(loc.map_or(0, |l| l.0))
+				.len(size)
+				.map_mut(&file)
+				.map_err(NewMachHookErr::MmapFailed)?
+		};
 
-        /*unsafe {
-            region::protect(mmap.as_ptr(), size, region::Protection::READ_WRITE_EXECUTE)?;
-        }*/
+        unsafe {
+            region::protect(mmap.as_ptr(), size, region::Protection::READ_WRITE_EXECUTE)
+				.map_err(NewMachHookErr::ProtectErr)?;
+        }
 
         fn header_matches(header: &MachHeader) -> bool {
             if cfg!(target_arch = "x86_64") {
@@ -119,11 +129,9 @@ impl MachHook {
         let (header, commands) = match OFile::parse(&mut cursor).map_err(NewMachHookErr::OFileParseFailed)? {
             OFile::MachFile { header, commands } => (header, commands),
             OFile::FatFile { magic: _, files } => return files.into_iter().map(|(arch, _)|
-                Self::new(lib_path.clone(), Some((arch.offset, arch.offset + arch.size)))
-            ).collect::<Result<Vec<Self>, NewMachHookErr>>()?
-            .into_iter()
-            .find(|hook| header_matches(&hook.header))
-            .ok_or_else(|| NewMachHookErr::NoFileMatchedArch),
+					Self::new(lib_path.clone(), Some((arch.offset, arch.offset + arch.size)))
+			).find_map(|hook| hook.ok().and_then(|h| header_matches(&h.header).then_some(h)))
+			.ok_or_else(|| NewMachHookErr::NoFileMatchedArch),
             _ => return Err(NewMachHookErr::NonMachOrFatFile)
         };
 
@@ -161,14 +169,15 @@ impl MachHook {
     }
 
     pub fn get_symbol_ptr(&self, symbol_name: &str) -> Option<*const ()> {
+		let offset = self.mmap.as_ptr() as usize;
         symbols!(symbols, self);
 
         symbols.find(|s| s.name() == Some(symbol_name))
             .and_then(|sym| match sym {
-                Symbol::Absolute { entry, .. } | Symbol::Defined { entry, .. } => Some(entry as *const ()),
+                Symbol::Absolute { entry, .. } | Symbol::Defined { entry, .. } => Some((entry + offset) as *const ()),
                 Symbol::Undefined { .. } | Symbol::Prebound { .. } => None,
                 Symbol::Indirect { symbol, .. } => symbol.and_then(|s| self.get_symbol_ptr(s)),
-                Symbol::Debug { addr, .. } => Some(addr as *const ())
+                Symbol::Debug { addr, .. } => Some((addr + offset) as *const ())
             })
     }
 
