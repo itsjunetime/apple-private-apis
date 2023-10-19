@@ -249,12 +249,22 @@ impl MachHook {
     }
 }
 
-#[sysv64]
-pub fn set_android_id_stub(id: *const u8, length: u32) -> i32 {
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+pub extern "C" fn set_android_id_stub(_id: *const u8, _length: u32) -> i32 {
     0
 }
 
-#[sysv64]
-pub fn set_android_prov_path_stub(path: *const u8) -> i32 {
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub extern "C" fn set_android_id_stub(_id: *const u8, _length: u32) -> i32 {
+    0
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+pub extern "C" fn set_android_prov_path_stub(_path: *const u8) -> i32 {
+    0
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub extern "sysv64" fn set_android_prov_path_stub(_path: *const u8) -> i32 {
     0
 }
