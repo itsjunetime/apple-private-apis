@@ -8,7 +8,9 @@ use mach_object::{
     Symbol, SymbolIter, MachHeader, Section, LoadCommand, OFile,
     CPU_TYPE_X86, CPU_TYPE_X86_64,
     CPU_TYPE_ARM, CPU_TYPE_ARM64,
-    CPU_TYPE_POWERPC, CPU_TYPE_POWERPC64
+    CPU_TYPE_POWERPC, CPU_TYPE_POWERPC64,
+	S_LAZY_SYMBOL_POINTERS, S_SYMBOL_STUBS, S_NON_LAZY_SYMBOL_POINTERS,
+	S_LAZY_DYLIB_SYMBOL_POINTERS, S_THREAD_LOCAL_VARIABLE_POINTERS
 };
 use memmap2::{MmapMut, MmapOptions};
 use android_loader::sysv64;
@@ -30,6 +32,7 @@ macro_rules! symbols{
         // If this returns an error, then the macho is malformed (due to it not having a valid
         // symoff) and impossible to parse correctly anyways.
         sym_cursor.seek(SeekFrom::Start($hook.symoff as u64)).unwrap();
+		#[allow(unused_mut)]
         let mut $iter = SymbolIter::new(
             &mut sym_cursor,
             $hook.sections.clone(),
@@ -83,23 +86,21 @@ impl std::error::Error for SymbolNotFound<'_> {}
 
 impl MachHook {
     pub fn new<P: AsRef<Path> + Clone>(lib_path: P, loc: Option<(u64, u64)>) -> Result<Self, NewMachHookErr> {
-		let file = std::fs::OpenOptions::new()
-			.read(true)
-			.write(true)
-			.open(&lib_path)
-			.map_err(NewMachHookErr::FileUnreadable)?;
+		let file = std::fs::read(&lib_path).map_err(NewMachHookErr::FileUnreadable)?;
         let size = loc.map_or_else(
             || std::fs::metadata(&lib_path).map_or(0, |m| m.size()),
             |(start, end)| end - start
         ) as usize;
 
-        let mmap = unsafe {
-			MmapOptions::new()
-				.offset(loc.map_or(0, |l| l.0))
-				.len(size)
-				.map_mut(&file)
-				.map_err(NewMachHookErr::MmapFailed)?
-		};
+        let mut mmap = MmapOptions::new()
+			.len(size)
+			.map_anon()
+			.map_err(NewMachHookErr::MmapFailed)?;
+
+		let start = loc.map_or(0, |l| l.0) as usize;
+		mmap[..].copy_from_slice(&file[start..start + size]);
+
+		println!("mmap'ed at {:?}", mmap.as_ptr());
 
         unsafe {
             region::protect(mmap.as_ptr(), size, region::Protection::READ_WRITE_EXECUTE)
@@ -157,7 +158,7 @@ impl MachHook {
             .flat_map(Vec::clone)
             .collect();
 
-        Ok(Self {
+        let mut hook = Self {
             mmap,
             header,
             symoff,
@@ -165,19 +166,111 @@ impl MachHook {
             stroff,
             strsize,
             sections,
-        })
+        };
+
+		symbols!(symbols, hook);
+
+		let handle = unsafe { libc::dlopen(std::ptr::null(), 0) };
+		let syms: Vec<_> = symbols.flat_map(|sym| match sym {
+			Symbol::Undefined { name, .. } | Symbol::Prebound { name, .. } => {
+				let Some(name) = name else {
+					return None;
+				};
+				let c_name = std::ffi::CString::new(&name[1..]).unwrap();
+				let ptr = unsafe { libc::dlsym(handle, c_name.as_ptr()) };
+				Some((name.to_string(), ptr as *const ()))
+			},
+			Symbol::Absolute { name, entry, .. } | Symbol::Defined { name, entry, .. } =>
+				name.map(|n| (n.to_string(), (entry + hook.mmap.as_ptr() as usize) as *const ())),
+			Symbol::Debug { name, addr, .. } =>
+				name.map(|n| (n.to_string(), (addr + hook.mmap.as_ptr() as usize) as *const ())),
+			// We'll handle indirects later
+			Symbol::Indirect { .. } =>None
+		}).collect();
+
+		for (name, resolved_addr) in syms {
+			if let Err(e) = hook.hook_fn(&name, resolved_addr) {
+				println!("couldn't hook {name} to {resolved_addr:?}: {e}");
+			}
+		}
+
+		// now we gotta resolve indirect symbols
+		// got bless https://github.com/opensource-apple/cctools/blob/master/otool/ofile_print.c#L7093
+		let (indirectoff, nindirect) = commands.iter()
+			.find_map(|cmd| match &cmd.0 {
+				LoadCommand::DySymTab { indirectsymoff, nindirectsyms, .. } => Some((indirectsymoff, nindirectsyms)),
+				_ => None
+			}).ok_or_else(|| NewMachHookErr::NoSymtabInFile)?;
+
+		let indirect_table = &hook.mmap.as_ref()[*indirectoff as usize..][..*nindirect as usize * 4];
+		let is_64bit = hook.header.is_64bit();
+
+		symbols!(symbols, hook);
+		let symbols: Vec<_> = symbols.collect();
+
+		let relocs = hook.sections.iter().flat_map(|sec| {
+			let s_type = sec.flags.sect_type();
+			let stride = if s_type == S_SYMBOL_STUBS {
+				sec.reserved2
+			} else if s_type == S_LAZY_SYMBOL_POINTERS ||
+			   s_type == S_NON_LAZY_SYMBOL_POINTERS ||
+			   s_type == S_LAZY_DYLIB_SYMBOL_POINTERS ||
+			   s_type == S_THREAD_LOCAL_VARIABLE_POINTERS {
+				if is_64bit { 8 } else { 4 }
+			} else {
+				return None;
+			} as usize;
+
+			if stride == 0 {
+				return None;
+			}
+
+			let start = sec.reserved1 as usize;
+
+			Some(indirect_table.chunks(4).skip(start).enumerate().filter_map(|(indir_idx, sym_idx)| {
+				let idx = u32::from_le_bytes(sym_idx.try_into().unwrap()) as usize;
+				let write_to = sec.addr + (indir_idx * stride);
+
+				if idx < symbols.len() {
+					let sym = &symbols[idx];
+					// they gotta be resolved at this point
+					let Symbol::Absolute { entry, .. } = sym else {
+						return None;
+					};
+					Some((write_to, *entry))
+				} else {
+					println!("trying to get index {idx}???");
+					None
+				}
+			}).collect::<Vec<_>>())
+		})
+		.flatten()
+		.collect::<Vec<_>>();
+
+		for (write_to, data) in relocs {
+			let mem = &mut hook.mmap.as_mut()[write_to..][..std::mem::size_of::<usize>()];
+			if is_64bit {
+				let ptr = bytemuck::cast::<usize, [u8; 8]>(data);
+				mem.copy_from_slice(&ptr);
+			} else {
+				let ptr = bytemuck::cast::<usize, [u8; 4]>(data);
+				mem.copy_from_slice(&ptr);
+			};
+		}
+
+		Ok(hook)
     }
 
     pub fn get_symbol_ptr(&self, symbol_name: &str) -> Option<*const ()> {
-		let offset = self.mmap.as_ptr() as usize;
+		// symbols should be resolved with offsets added in at this point
         symbols!(symbols, self);
 
         symbols.find(|s| s.name() == Some(symbol_name))
             .and_then(|sym| match sym {
-                Symbol::Absolute { entry, .. } | Symbol::Defined { entry, .. } => Some((entry + offset) as *const ()),
+                Symbol::Absolute { entry, .. } | Symbol::Defined { entry, .. } => Some(entry as *const ()),
                 Symbol::Undefined { .. } | Symbol::Prebound { .. } => None,
                 Symbol::Indirect { symbol, .. } => symbol.and_then(|s| self.get_symbol_ptr(s)),
-                Symbol::Debug { addr, .. } => Some((addr + offset) as *const ())
+                Symbol::Debug { addr, .. } => Some(addr as *const ())
             })
     }
 
