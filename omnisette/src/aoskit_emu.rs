@@ -10,10 +10,13 @@ use mach_object::{
     CPU_TYPE_ARM, CPU_TYPE_ARM64,
     CPU_TYPE_POWERPC, CPU_TYPE_POWERPC64,
     S_LAZY_SYMBOL_POINTERS, S_SYMBOL_STUBS, S_NON_LAZY_SYMBOL_POINTERS,
-    S_LAZY_DYLIB_SYMBOL_POINTERS, S_THREAD_LOCAL_VARIABLE_POINTERS
+    S_LAZY_DYLIB_SYMBOL_POINTERS, S_THREAD_LOCAL_VARIABLE_POINTERS,
+	SEG_DATA
 };
 use memmap2::{MmapMut, MmapOptions};
 use android_loader::sysv64;
+
+static USIZE_LEN: usize = std::mem::size_of::<usize>();
 
 #[derive(Debug)]
 pub struct MachHook {
@@ -99,11 +102,12 @@ impl MachHook {
 
         let start = loc.map_or(0, |l| l.0) as usize;
         mmap[..].copy_from_slice(&file[start..start + size]);
+		let mmap_start = mmap.as_ptr();
 
-        println!("mmap'ed at {:?}", mmap.as_ptr());
+        println!("mmap'ed at {:?}", mmap_start);
 
         unsafe {
-            region::protect(mmap.as_ptr(), size, region::Protection::READ_WRITE_EXECUTE)
+            region::protect(mmap_start, size, region::Protection::READ_WRITE_EXECUTE)
                 .map_err(NewMachHookErr::ProtectErr)?;
         }
 
@@ -181,9 +185,9 @@ impl MachHook {
                 Some((name.to_string(), ptr as *const ()))
             },
             Symbol::Absolute { name, entry, .. } | Symbol::Defined { name, entry, .. } =>
-                name.map(|n| (n.to_string(), (entry + hook.mmap.as_ptr() as usize) as *const ())),
+                name.map(|n| (n.to_string(), (entry + mmap_start as usize) as *const ())),
             Symbol::Debug { name, addr, .. } =>
-                name.map(|n| (n.to_string(), (addr + hook.mmap.as_ptr() as usize) as *const ())),
+                name.map(|n| (n.to_string(), (addr + mmap_start as usize) as *const ())),
             // We'll handle indirects later
             Symbol::Indirect { .. } =>None
         }).collect();
@@ -247,16 +251,41 @@ impl MachHook {
         .flatten()
         .collect::<Vec<_>>();
 
+		fn write_addr_to(mem: &mut [u8], write_to: usize, addr: usize) {
+			let loc = &mut mem[write_to..][..USIZE_LEN];
+			let ptr = addr.to_le_bytes();
+			loc.copy_from_slice(&ptr);
+		}
+
         for (write_to, data) in relocs {
-            let mem = &mut hook.mmap.as_mut()[write_to..][..std::mem::size_of::<usize>()];
-            if is_64bit {
-                let ptr = bytemuck::cast::<usize, [u8; 8]>(data);
-                mem.copy_from_slice(&ptr);
-            } else {
-                let ptr = bytemuck::cast::<usize, [u8; 4]>(data);
-                mem.copy_from_slice(&ptr);
-            };
+			write_addr_to(hook.mmap.as_mut(), write_to, data);
         }
+
+		// Now we need to go through every address in __DATA/__const and relocate it to the current
+		// executing address. I think. I cannot find any documentation about this anywhere so I'm
+		// just guessing
+		let (const_start, const_end) = hook.sections.iter()
+			.find(|sec| sec.segname == SEG_DATA && sec.sectname == "__const")
+			.map(|sec| (sec.offset as usize, sec.size))
+			.unwrap();
+
+		let mmap_len = hook.mmap.len();
+		for (offset, slice) in hook.mmap.as_mut()[const_start..][..const_end].chunks_mut(USIZE_LEN).enumerate() {
+			let addr = usize::from_le_bytes(slice.try_into().unwrap());
+			if addr < mmap_len {
+				write_addr_to(slice, 0, addr + mmap_start as usize);
+			} else {
+				eprintln!("Couldn't relocate __DATA/__const {addr} since it is outside bounds (max {mmap_len}, at {:?})", (const_start + (offset * USIZE_LEN)) as *const ());
+			}
+		}
+
+		// time to cheat!
+		// At 0x116d08, there should be a reference to a subroutine that checks the OS version.
+		// We just want to hijack that reference to make it work
+
+		let noop_loc = noop_stub as usize;
+		println!("writing {noop_loc} to 0x116d08");
+		write_addr_to(hook.mmap.as_mut(), 0x116d08, noop_loc + 2);
 
         Ok(hook)
     }
@@ -349,6 +378,16 @@ impl MachHook {
     pub unsafe fn dlclose(library: *mut MachHook) {
         let _ = Box::from_raw(library);
     }
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+pub extern "C" fn noop_stub() -> i32 {
+    0
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub extern "C" fn noop_stub() -> i32 {
+    0
 }
 
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
