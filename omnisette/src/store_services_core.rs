@@ -178,16 +178,17 @@ impl StoreServicesCoreADIProxy {
     pub fn from_macos_aoskit<P: AsRef<Path>>(path: P) -> Result<StoreServicesCoreADIProxy> {
         let mut hook = MachHook::new(&path, None)?;
 
-        hook.hook_fn("_arc4random", arc4random as *const ())?;
-        hook.hook_fn("_close", libc::close as *const ())?;
-        hook.hook_fn("_free", libc::free as *const ())?;
-        hook.hook_fn("_gettimeofday", libc::gettimeofday as *const ())?;
-        hook.hook_fn("_malloc", libc::malloc as *const ())?;
-        hook.hook_fn("_open", libc::open as *const ())?;
-        hook.hook_fn("_dlsym", MachHook::dlsym as *const ())?;
-        hook.hook_fn("_dlopen", MachHook::dlopen as *const ())?;
+		hook.hook_fn("_arc4random", arc4random as *const ())?;
+		hook.hook_fn("_free", libc::free as *const ())?;
+		hook.hook_fn("_malloc", libc::malloc as *const ())?;
+		hook.hook_fn("_dlsym", MachHook::dlsym as *const ())?;
+		// I think this may need to be replaced with __sl_dlopen?
+		hook.hook_fn("_dlopen", MachHook::dlopen as *const ())?;
 
         // The symbols that may not be present, so we're ok if trying to replace them returns an error
+		_ = hook.hook_fn("_close", libc::close as *const ());
+		_ = hook.hook_fn("_gettimeofday", libc::gettimeofday as *const ());
+		_ = hook.hook_fn("_open", libc::open as *const ());
         _ = hook.hook_fn("_read", libc::read as *const ());
         _ = hook.hook_fn("_strncpy", libc::strncpy as *const ());
         _ = hook.hook_fn("_umask", libc::umask as *const ());
@@ -201,16 +202,48 @@ impl StoreServicesCoreADIProxy {
         _ = hook.hook_fn("___errno", __errno_location as *const ());
         _ = hook.hook_fn("_dlclose", MachHook::dlclose as *const ());
 
-        let adi_provisioning_erase = hook.get_symbol_ptr("_p435tmhbla").unwrap();
-        let adi_synchronize = hook.get_symbol_ptr("_tn46gtiuhw").unwrap();
-        let adi_provisioning_destroy = hook.get_symbol_ptr("_fy34trz2st").unwrap();
-        let adi_provisioning_end = hook.get_symbol_ptr("_uv5t6nhkui").unwrap();
-        let adi_provisioning_start = hook.get_symbol_ptr("_rsegvyrt87").unwrap();
-        let adi_get_login_code = hook.get_symbol_ptr("_aslgmuibau").unwrap();
-        let adi_dispose = hook.get_symbol_ptr("_jk24uiwqrg").unwrap();
-        let adi_otp_request = hook.get_symbol_ptr("_qi864985u0").unwrap();
+		/*let adi_provisioning_erase = hook.get_objc_method_ptr("AKADIProxy", "eraseProvisioningForDSID:").unwrap();
+        let adi_synchronize = hook.get_objc_method_ptr("AKADIProxy", "synchronizeWithDSID:SIM:SIMLength:outMID:outMIDLength:outSRM:outSRMLength:").unwrap();
+        let adi_provisioning_destroy = hook.get_objc_method_ptr("AKADIProxy", "destroyProvisioningSession:").unwrap();
+        let adi_provisioning_end = hook.get_objc_method_ptr("AKADIProxy", "endProvisioningWithSession:PTM:PTMLength:TK:TKLength:").unwrap();
+        let adi_provisioning_start = hook.get_objc_method_ptr("AKADIProxy", "startProvisioningWithDSID:SPIM:SPIMLength:outCPIM:outCPIMLength:outSession:").unwrap();
+		// hmmmm ok so this one (or what I think is this one), on akd, takes two args: a pointer to
+		// write the data at, and the dsid to process. So uh. Dunno what to do about that exactly,
+		// we'll figure it out later.
+		// maybe we just do a stub? hmmmm. It just seems to return 0x2020600 if we pass in -2,
+		// which we will, so yeah probably stub it out
+        // let adi_get_login_code = hook.get_symbol_ptr("+[AKADIProxy getIDMSRoutingInfo:forDSID:").unwrap();
+		let adi_get_login_code = crate::aoskit_emu::get_login_code;
+        let adi_dispose = hook.get_objc_method_ptr("AKADIProxy", "dispose:").unwrap();
+        let adi_otp_request = hook.get_objc_method_ptr("AKADIProxy", "requestOTPForDSID:outMID:outMIDSize:outOTP:outOTPSize:").unwrap();*/
+        let adi_provisioning_erase = hook
+            .get_symbol_ptr("_p435tmhbla")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_synchronize = hook
+            .get_symbol_ptr("_tn46gtiuhw")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_provisioning_destroy = hook
+            .get_symbol_ptr("_fy34trz2st")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_provisioning_end = hook
+            .get_symbol_ptr("_uv5t6nhkui")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_provisioning_start = hook
+            .get_symbol_ptr("_rsegvyrt87")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_get_login_code = hook
+            .get_symbol_ptr("_aslgmuibau")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_dispose = hook
+            .get_symbol_ptr("_jk24uiwqrg")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
+        let adi_otp_request = hook
+            .get_symbol_ptr("_qi864985u0")
+            .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
 
 		println!("erase: {adi_provisioning_erase:?}");
+
+		hook.make_exec().unwrap();
 
         let provider = unsafe {
             StoreServicesCoreADIProxy {
@@ -313,6 +346,8 @@ impl ADIProxy for StoreServicesCoreADIProxy {
 
         let mut session: u32 = 0;
 
+		println!("start: {:?}", self.adi_provisioning_start);
+
         match (self.adi_provisioning_start)(
             ds_id,
             spim_ptr,
@@ -321,7 +356,8 @@ impl ADIProxy for StoreServicesCoreADIProxy {
             &mut cpim_size,
             &mut session,
         ) {
-            0 => {
+            0 | -45004 => {
+				println!("cpim_size: {cpim_size}, cpim_ptr: {cpim_ptr:?}");
                 let mut cpim = vec![0; cpim_size as usize];
 
                 // SAFETY: This is safe as long as the library correctly initializes the data at
@@ -439,6 +475,11 @@ unsafe fn __errno_location() -> *mut i32 {
 #[sysv64]
 fn arc4random() -> u32 {
     rand::thread_rng().gen()
+}
+
+#[sysv64]
+fn arc4random_uniform(upper: u32) -> u32 {
+	rand::thread_rng().gen_range(0..upper)
 }
 
 #[sysv64]

@@ -1,6 +1,6 @@
 use crate::adi_proxy::ProvisioningError::InvalidResponse;
 use crate::anisette_headers_provider::AnisetteHeadersProvider;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use base64::engine::general_purpose::STANDARD as base64_engine;
 use base64::Engine;
 use log::debug;
@@ -50,21 +50,47 @@ impl ADIError {
     }
 }
 
+#[derive(Debug)]
+enum ToPlistError {
+	Plist(plist::Error),
+	Bytes(reqwest::Error)
+}
+
+impl From<reqwest::Error> for ToPlistError {
+	fn from(err: reqwest::Error) -> Self {
+		Self::Bytes(err)
+	}
+}
+
+impl From<plist::Error> for ToPlistError {
+	fn from(err: plist::Error) -> Self {
+		Self::Plist(err)
+	}
+}
+
+impl std::fmt::Display for ToPlistError {
+	fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+		match self {
+			ToPlistError::Bytes(err) => write!(fmt, "Error decoding from bytes: {err}"),
+			ToPlistError::Plist(err) => write!(fmt, "Error decoding to plist: {err}"),
+		}
+	}
+}
+
+impl std::error::Error for ToPlistError {}
+
 #[cfg_attr(feature = "async", async_trait::async_trait)]
 trait ToPlist {
     #[cfg_attr(not(feature = "async"), remove_async_await::remove_async_await)]
-    async fn plist(self) -> Result<Dictionary>;
+    async fn plist(self) -> Result<Dictionary, ToPlistError>;
 }
 
 #[cfg_attr(feature = "async", async_trait::async_trait)]
 impl ToPlist for Response {
     #[cfg_attr(not(feature = "async"), remove_async_await::remove_async_await)]
-    async fn plist(self) -> Result<Dictionary> {
-        if let Ok(property_list) = Value::from_reader_xml(&*self.bytes().await?) {
-            Ok(property_list.as_dictionary().unwrap().to_owned())
-        } else {
-            Err(ProvisioningError::InvalidResponse.into())
-        }
+    async fn plist(self) -> Result<Dictionary, ToPlistError> {
+        Ok(Value::from_reader_xml(&*self.bytes().await?)
+			.map(|list| list.as_dictionary().unwrap().to_owned())?)
     }
 }
 
@@ -198,9 +224,11 @@ impl dyn ADIProxy {
         let url_bag_res = client
             .get("https://gsa.apple.com/grandslam/GsService2/lookup")
             .send()
-            .await?
+            .await
+			.map_err(|e| anyhow!("Couldn't send lookup: {e}"))?
             .plist()
-            .await?;
+            .await
+			.map_err(|e| anyhow!("Couldn't decode lookup response to a plist: {e}"))?;
 
         let urls = url_bag_res.get("urls").unwrap().as_dictionary().unwrap();
 
@@ -233,9 +261,11 @@ impl dyn ADIProxy {
             .post(start_provisioning_url)
             .body(sp_request)
             .send()
-            .await?
+            .await
+			.map_err(|e| anyhow!("Couldn't send req to start provisioning at {start_provisioning_url}: {e}"))?
             .plist()
-            .await?;
+            .await
+			.map_err(|e| anyhow!("Couldn't resolve start provisioning response to plist: {e}"))?;
 
         let response = response.get_response()?;
 
@@ -246,8 +276,9 @@ impl dyn ADIProxy {
             .unwrap()
             .to_owned();
 
-        let spim = base64_engine.decode(spim)?;
-        let first_step = self.start_provisioning(DS_ID, spim.as_slice())?;
+        let spim = base64_engine.decode(spim).map_err(|e| anyhow!("Couldn't decode spim to base64: {e}"))?;
+        let first_step = self.start_provisioning(DS_ID, spim.as_slice())
+			.map_err(|e| anyhow!("Couldn't start provision: {e}"))?;
 
         let mut body = Dictionary::new();
         let mut request = Dictionary::new();
@@ -258,24 +289,33 @@ impl dyn ADIProxy {
         body.insert("Header".to_owned(), Value::Dictionary(Dictionary::new()));
         body.insert("Request".to_owned(), Value::Dictionary(request));
 
+		println!("fp_req: {body:?}");
+
         let mut fp_request = Vec::new();
-        Value::Dictionary(body).to_writer_xml(&mut fp_request)?;
+        Value::Dictionary(body).to_writer_xml(&mut fp_request)
+			.map_err(|e| anyhow!("Couldn't write to xml: {e}"))?;
 
         debug!("Second provisioning request...");
         let response = client
             .post(finish_provisioning_url)
             .body(fp_request)
             .send()
-            .await?
+            .await
+			.map_err(|e| anyhow!("Couldn't send finish provisioning req to {finish_provisioning_url}: {e}"))?
             .plist()
-            .await?;
+            .await
+			.map_err(|e| anyhow!("Couldn't decode finish provisioning req to plist: {e}"))?;
 
-        let response = response.get_response()?;
+        let response = response.get_response()
+			.map_err(|e| anyhow!("Couldn't get response from finish response: {e}"))?;
 
-        let ptm = base64_engine.decode(response.get("ptm").unwrap().as_string().unwrap())?;
-        let tk = base64_engine.decode(response.get("tk").unwrap().as_string().unwrap())?;
+        let ptm = base64_engine.decode(response.get("ptm").unwrap().as_string().unwrap())
+			.map_err(|e| anyhow!("Couldn't decode ptm from base64: {e}"))?;
+        let tk = base64_engine.decode(response.get("tk").unwrap().as_string().unwrap())
+			.map_err(|e| anyhow!("Couldn't decode tk from base64: {e}"))?;
 
-        self.end_provisioning(first_step.session, ptm.as_slice(), tk.as_slice())?;
+        self.end_provisioning(first_step.session, ptm.as_slice(), tk.as_slice())
+			.map_err(|e| anyhow!("Couldn't end provisioning: {e}"))?;
         debug!("Done.");
 
         Ok(())
@@ -366,10 +406,12 @@ impl<ProxyType: ADIProxy + 'static> AnisetteHeadersProvider
         let adi_proxy = &mut self.adi_proxy as &mut dyn ADIProxy;
 
         if !adi_proxy.is_machine_provisioned(DS_ID) && !skip_provisioning {
-            adi_proxy.provision_device().await?;
+            adi_proxy.provision_device().await
+				.map_err(|e| anyhow!("Couldn't provision: {e}"))?;
         }
 
-        let machine_data = adi_proxy.request_otp(DS_ID)?;
+        let machine_data = adi_proxy.request_otp(DS_ID)
+			.map_err(|e| anyhow!("Couldn't request otp: {e}"))?;
 
         let mut headers = HashMap::new();
         headers.insert(
