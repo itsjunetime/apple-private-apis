@@ -168,6 +168,7 @@ impl MachHook {
                 _ => None
             }).ok_or_else(|| NewMachHookErr::NoSymtabInFile)?;
 
+		// shouldn't this be pulled from __PAGEZERO specifically?
 		let load_addr = commands.iter()
 			.find_map(|cmd| match cmd.0 {
 				LoadCommand::Segment { vmaddr, .. }
@@ -304,8 +305,6 @@ impl MachHook {
 		fn process_export_node(mut offset: usize, data: &[u8], cumulative: &mut String) -> Vec<TrieData> {
 			let mut parent_entry = None;
 			let (terminal_size, term_increase) = MachHook::read_uleb128(&data[offset..]);
-			println!("got terminal_size {terminal_size} at {offset} with str {cumulative}");
-			println!("terminal_size data {:?}", &data[offset..][..term_increase]);
 			if terminal_size != 0 {
 				offset += term_increase;
 				let mut uleb_ptr = &data[offset + term_increase..];
@@ -328,7 +327,6 @@ impl MachHook {
 						.split(|x| *x == 0)
 						.next()
 						.map(String::from_utf8_lossy)
-
 						.map(std::borrow::Cow::into_owned);
 				} else {
 					address = next_uleb;
@@ -499,7 +497,6 @@ impl MachHook {
 					(1..8).map(|off| const_start + idx + (off * USIZE_LEN)).collect()
 				};
 				idx += 8 * USIZE_LEN;
-				println!("got relocs {res:?}");
 				Some(res)
 			}).flatten());
 		}
@@ -542,7 +539,6 @@ impl MachHook {
         unsafe {
             region::protect(mmap_start, size, region::Protection::READ_WRITE_EXECUTE).unwrap();
         }
-
 
         Ok(hook)
     }
@@ -796,22 +792,4 @@ pub extern "C" fn set_android_prov_path_stub(_path: *const u8) -> i32 {
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub extern "sysv64" fn set_android_prov_path_stub(_path: *const u8) -> i32 {
     0
-}
-
-#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
-pub extern "C" fn get_login_code(dsid: i64) -> i32 {
-	if dsid == -2 {
-		0x2020600
-	} else {
-		0
-	}
-}
-
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub extern "sysv64" fn get_login_code(dsid: i64) -> i32 {
-	if dsid == -2 {
-		0x2020600
-	} else {
-		0
-	}
 }

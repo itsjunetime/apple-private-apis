@@ -356,7 +356,7 @@ impl ADIProxy for StoreServicesCoreADIProxy {
             &mut cpim_size,
             &mut session,
         ) {
-            0 | -45004 => {
+            0 => {
 				println!("cpim_size: {cpim_size}, cpim_ptr: {cpim_ptr:?}");
                 let mut cpim = vec![0; cpim_size as usize];
 
