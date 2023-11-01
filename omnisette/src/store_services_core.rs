@@ -184,6 +184,8 @@ impl StoreServicesCoreADIProxy {
 		hook.hook_fn("_dlsym", MachHook::dlsym as *const ())?;
 		// I think this may need to be replaced with __sl_dlopen?
 		hook.hook_fn("_dlopen", MachHook::dlopen as *const ())?;
+		hook.hook_fn("___stack_chk_guard", crate::aoskit_emu::noop_stub as *const ())?;
+		hook.hook_fn("_NSVersionOfRunTimeLibrary", crate::aoskit_emu::nsversion_of_run_time_library as *const ())?;
 
         // The symbols that may not be present, so we're ok if trying to replace them returns an error
 		_ = hook.hook_fn("_close", libc::close as *const ());

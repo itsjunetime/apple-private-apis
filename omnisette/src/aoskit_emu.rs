@@ -1,17 +1,17 @@
 use std::{
-    io::{Seek, SeekFrom, Cursor},
-    rc::Rc,
-    os::unix::fs::MetadataExt,
-    path::Path
+	io::{Seek, SeekFrom, Cursor},
+	rc::Rc,
+	os::unix::fs::MetadataExt,
+	path::Path,
 };
 use mach_object::{
-    Symbol, SymbolIter, MachHeader, Section, LoadCommand, OFile,
-    CPU_TYPE_X86, CPU_TYPE_X86_64,
-    CPU_TYPE_ARM, CPU_TYPE_ARM64,
-    CPU_TYPE_POWERPC, CPU_TYPE_POWERPC64,
-    S_LAZY_SYMBOL_POINTERS, S_SYMBOL_STUBS, S_NON_LAZY_SYMBOL_POINTERS,
-    S_LAZY_DYLIB_SYMBOL_POINTERS, S_THREAD_LOCAL_VARIABLE_POINTERS,
-	SEG_DATA,
+	Symbol, SymbolIter, MachHeader, Section, LoadCommand, OFile,
+	CPU_TYPE_X86, CPU_TYPE_X86_64,
+	CPU_TYPE_ARM, CPU_TYPE_ARM64,
+	CPU_TYPE_POWERPC, CPU_TYPE_POWERPC64,
+	S_LAZY_SYMBOL_POINTERS, S_SYMBOL_STUBS, S_NON_LAZY_SYMBOL_POINTERS,
+	S_LAZY_DYLIB_SYMBOL_POINTERS, S_THREAD_LOCAL_VARIABLE_POINTERS,
+	SEG_DATA, MachCommand,
 };
 use memmap2::{MmapMut, MmapOptions};
 use android_loader::sysv64;
@@ -21,59 +21,76 @@ const EXPORT_SYMBOL_FLAGS_REEXPORT: usize = 0x08;
 const EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER: usize = 0x10;
 
 #[derive(Debug)]
+struct Binding {
+	file_offset: usize,
+	library_ordinal: isize,
+	addend: isize,
+	trailing_flags: u8,
+	sym_type: u8,
+	sym_name: String,
+}
+
+#[derive(Debug)]
+pub struct SymInfo {
+	symoff: u64,
+	nsyms: u32,
+	stroff: u32,
+	strsize: u32
+}
+
+#[derive(Debug)]
 pub struct MachHook {
-    mmap: MmapMut,
-    header: MachHeader,
-    symoff: u32,
-    nsyms: u32,
-    stroff: u32,
-    strsize: u32,
-    sections: Vec<Rc<Section>>,
+	mmap: MmapMut,
+	header: MachHeader,
+	commands: Vec<MachCommand>,
+	sections: Vec<Rc<Section>>,
+	bindings: Vec<Binding>,
+	sym_info: SymInfo
 }
 
 macro_rules! symbols{
-    ($iter:ident, $hook:ident) => {
-        let mut sym_cursor = Cursor::new($hook.mmap.as_ref());
-        // If this returns an error, then the macho is malformed (due to it not having a valid
-        // symoff) and impossible to parse correctly anyways.
-        sym_cursor.seek(SeekFrom::Start($hook.symoff as u64)).unwrap();
-        #[allow(unused_mut)]
-        let mut $iter = SymbolIter::new(
-            &mut sym_cursor,
-            $hook.sections.clone(),
-            $hook.nsyms,
-            $hook.stroff as u32,
-            $hook.strsize,
-            $hook.header.is_bigend(),
-            $hook.header.is_64bit()
-        );
-    }
+	($iter:ident, $hook:ident) => {
+		let mut sym_cursor = Cursor::new($hook.mmap.as_ref());
+		// If this returns an error, then the macho is malformed (due to it not having a valid
+		// symoff) and impossible to parse correctly anyways.
+		sym_cursor.seek(SeekFrom::Start($hook.sym_info.symoff)).unwrap();
+		#[allow(unused_mut)]
+		let mut $iter = SymbolIter::new(
+			&mut sym_cursor,
+			$hook.sections.clone(),
+			$hook.sym_info.nsyms,
+			$hook.sym_info.stroff,
+			$hook.sym_info.strsize,
+			$hook.header.is_bigend(),
+			$hook.header.is_64bit()
+		);
+	}
 }
 
 #[derive(Debug)]
 pub enum NewMachHookErr {
-    FileUnreadable(std::io::Error),
-    MmapFailed(std::io::Error),
-    OFileParseFailed(mach_object::MachError),
-    ProtectErr(region::Error),
-    NoFileMatchedArch,
-    NonMachOrFatFile,
-    NoSymtabInFile,
+	FileUnreadable(std::io::Error),
+	MmapFailed(std::io::Error),
+	OFileParseFailed(mach_object::MachError),
+	ProtectErr(region::Error),
+	NoFileMatchedArch,
+	NonMachOrFatFile,
+	NoSymtabInFile,
 }
 
 impl std::fmt::Display for NewMachHookErr {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        use NewMachHookErr::*;
-        match self {
-            FileUnreadable(e) => write!(f, "Input file is unreadable: {e}"),
-            MmapFailed(e) => write!(f, "Mmap'ing file data into memory failed: {e}"),
-            OFileParseFailed(e) => write!(f, "Couldn't parse Mach-o file: {e}"),
-            ProtectErr(e) => write!(f, "Couldn't protection mmap'ed region: {e}"),
-            NoFileMatchedArch => write!(f, "Input file had no sections that matched the arch of this device"),
-            NonMachOrFatFile => write!(f, "This is a mach-o file, but something like an ar file which we can't process"),
-            NoSymtabInFile => write!(f, "The input file somehow has no Symtab load command")
-        }
-    }
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		use NewMachHookErr::*;
+		match self {
+			FileUnreadable(e) => write!(f, "Input file is unreadable: {e}"),
+			MmapFailed(e) => write!(f, "Mmap'ing file data into memory failed: {e}"),
+			OFileParseFailed(e) => write!(f, "Couldn't parse Mach-o file: {e}"),
+			ProtectErr(e) => write!(f, "Couldn't protection mmap'ed region: {e}"),
+			NoFileMatchedArch => write!(f, "Input file had no sections that matched the arch of this device"),
+			NonMachOrFatFile => write!(f, "This is a mach-o file, but something like an ar file which we can't process"),
+			NoSymtabInFile => write!(f, "The input file somehow has no Symtab load command")
+		}
+	}
 }
 
 impl std::error::Error for NewMachHookErr {}
@@ -82,9 +99,9 @@ impl std::error::Error for NewMachHookErr {}
 pub struct SymbolNotFound<'s>(&'s str);
 
 impl std::fmt::Display for SymbolNotFound<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "Symbol for '{}' was not found", self.0)
-    }
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		write!(f, "Symbol for '{}' was not found", self.0)
+	}
 }
 
 impl std::error::Error for SymbolNotFound<'_> {}
@@ -109,64 +126,64 @@ struct TrieData {
 }
 
 impl MachHook {
-    pub fn new<P: AsRef<Path> + Clone>(lib_path: P, loc: Option<(u64, u64)>) -> Result<Self, NewMachHookErr> {
-        let file = std::fs::read(&lib_path).map_err(NewMachHookErr::FileUnreadable)?;
-        let size = loc.map_or_else(
-            || std::fs::metadata(&lib_path).map_or(0, |m| m.size()),
-            |(start, end)| end - start
-        ) as usize;
+	pub fn new<P: AsRef<Path> + Clone>(lib_path: P, loc: Option<(u64, u64)>) -> Result<Self, NewMachHookErr> {
+		let file = std::fs::read(&lib_path).map_err(NewMachHookErr::FileUnreadable)?;
+		let size = loc.map_or_else(
+			|| std::fs::metadata(&lib_path).map_or(0, |m| m.size()),
+			|(start, end)| end - start
+		) as usize;
 
-        let mut mmap = MmapOptions::new()
-            .len(size)
-            .map_anon()
-            .map_err(NewMachHookErr::MmapFailed)?;
+		let mut mmap = MmapOptions::new()
+			.len(size)
+			.map_anon()
+			.map_err(NewMachHookErr::MmapFailed)?;
 
-        let start = loc.map_or(0, |l| l.0) as usize;
-        mmap[..].copy_from_slice(&file[start..start + size]);
+		let start = loc.map_or(0, |l| l.0) as usize;
+		mmap[..].copy_from_slice(&file[start..start + size]);
 		let mmap_start = mmap.as_ptr();
 
-        println!("mmap: {mmap_start:?} -> {:x}", mmap_start as usize + mmap.len());
+		println!("mmap: {mmap_start:?} -> {:x}", mmap_start as usize + mmap.len());
 
-        fn header_matches(header: &MachHeader) -> bool {
-            if cfg!(target_arch = "x86_64") {
-                header.cputype == CPU_TYPE_X86_64
-            } else if cfg!(target_arch = "x86") {
-                header.cputype == CPU_TYPE_X86 && !header.is_64bit()
-            } else if cfg!(target_arch = "aarch64") {
-                header.cputype == CPU_TYPE_ARM64
-            } else if cfg!(target_arch = "arm") {
-                header.cputype == CPU_TYPE_ARM && !header.is_64bit()
-            } else if cfg!(target_arch = "powerpc") {
-                header.cputype == CPU_TYPE_POWERPC && !header.is_64bit()
-            } else if cfg!(target_arch = "powerpc64") {
-                header.cputype == CPU_TYPE_POWERPC64
-            } else {
-                false
-            }
-        }
+		fn header_matches(header: &MachHeader) -> bool {
+			if cfg!(target_arch = "x86_64") {
+				header.cputype == CPU_TYPE_X86_64
+			} else if cfg!(target_arch = "x86") {
+				header.cputype == CPU_TYPE_X86 && !header.is_64bit()
+			} else if cfg!(target_arch = "aarch64") {
+				header.cputype == CPU_TYPE_ARM64
+			} else if cfg!(target_arch = "arm") {
+				header.cputype == CPU_TYPE_ARM && !header.is_64bit()
+			} else if cfg!(target_arch = "powerpc") {
+				header.cputype == CPU_TYPE_POWERPC && !header.is_64bit()
+			} else if cfg!(target_arch = "powerpc64") {
+				header.cputype == CPU_TYPE_POWERPC64
+			} else {
+				false
+			}
+		}
 
-        let mut cursor = Cursor::new(mmap.as_ref());
+		let mut cursor = Cursor::new(mmap.as_ref());
 
-        let (header, commands) = match OFile::parse(&mut cursor).map_err(NewMachHookErr::OFileParseFailed)? {
-            OFile::MachFile { header, commands } => (header, commands),
-            OFile::FatFile { magic: _, files } => return files.into_iter().map(|(arch, _)|
-                Self::new(lib_path.clone(), Some((arch.offset, arch.offset + arch.size)))
-            ).find_map(|hook| hook.ok().and_then(|h| header_matches(&h.header).then_some(h)))
-            .ok_or_else(|| NewMachHookErr::NoFileMatchedArch),
-            _ => return Err(NewMachHookErr::NonMachOrFatFile)
-        };
+		let (header, commands) = match OFile::parse(&mut cursor).map_err(NewMachHookErr::OFileParseFailed)? {
+			OFile::MachFile { header, commands } => (header, commands),
+			OFile::FatFile { magic: _, files } => return files.into_iter().map(|(arch, _)|
+				Self::new(lib_path.clone(), Some((arch.offset, arch.offset + arch.size)))
+			).find_map(|hook| hook.ok().and_then(|h| header_matches(&h.header).then_some(h)))
+			.ok_or_else(|| NewMachHookErr::NoFileMatchedArch),
+			_ => return Err(NewMachHookErr::NonMachOrFatFile)
+		};
 
-        if !header_matches(&header) {
-            return Err(NewMachHookErr::NoFileMatchedArch);
-        }
+		if !header_matches(&header) {
+			return Err(NewMachHookErr::NoFileMatchedArch);
+		}
 
-        let (symoff, nsyms, stroff, strsize) = commands.iter()
-            .find_map(|cmd| match &cmd.0 {
-                LoadCommand::SymTab {
-                    symoff, nsyms, stroff, strsize
-                } => Some((*symoff, *nsyms, *stroff, *strsize)),
-                _ => None
-            }).ok_or_else(|| NewMachHookErr::NoSymtabInFile)?;
+		let (symoff, nsyms, stroff, strsize) = commands.iter()
+			.find_map(|cmd| match &cmd.0 {
+				LoadCommand::SymTab {
+					symoff, nsyms, stroff, strsize
+				} => Some((*symoff, *nsyms, *stroff, *strsize)),
+				_ => None
+			}).ok_or_else(|| NewMachHookErr::NoSymtabInFile)?;
 
 		// shouldn't this be pulled from __PAGEZERO specifically?
 		let load_addr = commands.iter()
@@ -176,113 +193,122 @@ impl MachHook {
 				_ => None
 			}).unwrap();
 
-        let sections: Vec<Rc<Section>> = commands
-            .iter()
-            .filter_map(|cmd| match cmd.0 {
-                LoadCommand::Segment { ref sections, .. }
-                | LoadCommand::Segment64 { ref sections, .. } => Some(sections),
-                _ => None
-            })
-            .flat_map(Vec::clone)
-            .collect();
+		let sections: Vec<Rc<Section>> = commands
+			.iter()
+			.filter_map(|cmd| match cmd.0 {
+				LoadCommand::Segment { ref sections, .. }
+				| LoadCommand::Segment64 { ref sections, .. } => Some(sections),
+				_ => None
+			})
+			.flat_map(Vec::clone)
+			.collect();
 
-        let mut hook = Self {
-            mmap,
-            header,
-            symoff,
-            nsyms,
-            stroff,
-            strsize,
-            sections,
-        };
+		let mut hook = Self {
+			mmap,
+			header,
+			commands,
+			sections,
+			bindings: Vec::new(),
+			sym_info: SymInfo {
+				symoff: symoff as _,
+				nsyms,
+				stroff,
+				strsize
+			}
+		};
 
 		// we need this to be signed because, since we're using images extracted from dyldex, their
 		// expected load position may be way higher than the mmap_start, so we'll need to offset the
 		// symbols back
 		let sym_offset = mmap_start as isize - load_addr as isize;
 		println!("sym_offset: {sym_offset}");
-        symbols!(symbols, hook);
+		symbols!(symbols, hook);
 
-        let handle = unsafe { libc::dlopen(std::ptr::null(), 0) };
-        let syms: Vec<_> = symbols.flat_map(|sym| match sym {
-            Symbol::Undefined { name, .. } | Symbol::Prebound { name, .. } => {
-                let Some(name) = name else {
-                    return None;
-                };
-                let c_name = std::ffi::CString::new(&name[1..]).unwrap();
-                let ptr = unsafe { libc::dlsym(handle, c_name.as_ptr()) };
-                Some((name.to_string(), ptr as *const ()))
-            },
-            Symbol::Absolute { name, entry, .. } | Symbol::Defined { name, entry, .. } =>
-                name.map(|n| (n.to_string(), (entry as isize + sym_offset) as *const ())),
-            Symbol::Debug { name, addr, .. } =>
-                name.map(|n| (n.to_string(), (addr as isize + sym_offset) as *const ())),
-            // We'll handle indirects later
-            Symbol::Indirect { .. } =>None
-        }).collect();
+		let handle = unsafe { libc::dlopen(std::ptr::null(), 0) };
+		let syms: Vec<_> = symbols.flat_map(|sym| match sym {
+			Symbol::Undefined { name, .. } | Symbol::Prebound { name, .. } => {
+				let Some(name) = name else {
+					return None;
+				};
+				let c_name = std::ffi::CString::new(&name[1..]).unwrap();
+				let ptr = unsafe { libc::dlsym(handle, c_name.as_ptr()) };
+				if ptr.is_null() {
+					None
+				} else {
+					println!("found ptr for {name} at {ptr:?}");
+					Some((name.to_string(), ptr as *const ()))
+				}
+			},
+			Symbol::Absolute { name, entry, .. } | Symbol::Defined { name, entry, .. } =>
+				name.map(|n| (n.to_string(), (entry as isize + sym_offset) as *const ())),
+			Symbol::Debug { name, addr, .. } =>
+				name.map(|n| (n.to_string(), (addr as isize + sym_offset) as *const ())),
+			// We'll handle indirects later
+			Symbol::Indirect { .. } =>None
+		}).collect();
 
-        for (name, resolved_addr) in syms {
-            if let Err(e) = hook.hook_fn(&name, resolved_addr) {
-                println!("couldn't hook {name} to {resolved_addr:?}: {e}");
-            }
-        }
+		for (name, resolved_addr) in syms {
+			if let Err(e) = hook.hook_fn(&name, resolved_addr) {
+				println!("couldn't hook {name} to {resolved_addr:?}: {e}");
+			}
+		}
 
-        // now we gotta resolve indirect symbols
-        // got bless https://github.com/opensource-apple/cctools/blob/master/otool/ofile_print.c#L7093
-        let (indirectoff, nindirect) = commands.iter()
-            .find_map(|cmd| match &cmd.0 {
-                LoadCommand::DySymTab { indirectsymoff, nindirectsyms, .. } => Some((indirectsymoff, nindirectsyms)),
-                _ => None
-            }).ok_or_else(|| NewMachHookErr::NoSymtabInFile)?;
+		// now we gotta resolve indirect symbols
+		// got bless https://github.com/opensource-apple/cctools/blob/master/otool/ofile_print.c#L7093
+		let (indirectoff, nindirect) = hook.commands.iter()
+			.find_map(|cmd| match &cmd.0 {
+				LoadCommand::DySymTab { indirectsymoff, nindirectsyms, .. } => Some((indirectsymoff, nindirectsyms)),
+				_ => None
+			}).ok_or_else(|| NewMachHookErr::NoSymtabInFile)?;
 
-        let indirect_table = &hook.mmap.as_ref()[*indirectoff as usize..][..*nindirect as usize * 4];
-        let is_64bit = hook.header.is_64bit();
+		let indirect_table = &hook.mmap.as_ref()[*indirectoff as usize..][..*nindirect as usize * 4];
+		let is_64bit = hook.header.is_64bit();
 
-        symbols!(symbols, hook);
-        let symbols: Vec<_> = symbols.collect();
+		symbols!(symbols, hook);
+		let symbols: Vec<_> = symbols.collect();
 
-        let relocs = hook.sections.iter().flat_map(|sec| {
-            let s_type = sec.flags.sect_type();
-            let stride = if s_type == S_SYMBOL_STUBS {
-                sec.reserved2
-            } else if s_type == S_LAZY_SYMBOL_POINTERS ||
-               s_type == S_NON_LAZY_SYMBOL_POINTERS ||
-               s_type == S_LAZY_DYLIB_SYMBOL_POINTERS ||
-               s_type == S_THREAD_LOCAL_VARIABLE_POINTERS {
-                if is_64bit { 8 } else { 4 }
-            } else {
-                return None;
-            } as usize;
+		let relocs = hook.sections.iter().flat_map(|sec| {
+			let s_type = sec.flags.sect_type();
+			let stride = if s_type == S_SYMBOL_STUBS {
+				sec.reserved2
+			} else if s_type == S_LAZY_SYMBOL_POINTERS ||
+			   s_type == S_NON_LAZY_SYMBOL_POINTERS ||
+			   s_type == S_LAZY_DYLIB_SYMBOL_POINTERS ||
+			   s_type == S_THREAD_LOCAL_VARIABLE_POINTERS {
+				if is_64bit { 8 } else { 4 }
+			} else {
+				return None;
+			} as usize;
 
-            if stride == 0 {
-                return None;
-            }
+			if stride == 0 {
+				return None;
+			}
 
-            let start = sec.reserved1 as usize;
+			let start = sec.reserved1 as usize;
 
-            Some(indirect_table.chunks(4).skip(start).enumerate().filter_map(|(indir_idx, sym_idx)| {
-                let idx = u32::from_le_bytes(sym_idx.try_into().unwrap()) as usize;
-                let write_to = sec.offset as usize + (indir_idx * stride);
+			Some(indirect_table.chunks(4).skip(start).enumerate().filter_map(|(indir_idx, sym_idx)| {
+				let idx = u32::from_le_bytes(sym_idx.try_into().unwrap()) as usize;
+				let write_to = sec.offset as usize + (indir_idx * stride);
 
-                if idx < symbols.len() {
-                    let sym = &symbols[idx];
+				if idx < symbols.len() {
+					let sym = &symbols[idx];
 					// println!("got indir {sym:?}");
-                    // they gotta be resolved at this point
-                    let Symbol::Absolute { entry, .. } = sym else {
-                        return None;
-                    };
+					// they gotta be resolved at this point
+					let Symbol::Absolute { entry, .. } = sym else {
+						return None;
+					};
 					if *entry == 0 {
 						return None;
 					}
-                    Some((write_to, *entry))
-                } else {
-                    println!("trying to get index {idx}???");
-                    None
-                }
-            }).collect::<Vec<_>>())
-        })
-        .flatten()
-        .collect::<Vec<_>>();
+					Some((write_to, *entry))
+				} else {
+					println!("trying to get index {idx}???");
+					None
+				}
+			}).collect::<Vec<_>>())
+		})
+		.flatten()
+		.collect::<Vec<_>>();
 
 		fn write_addr_to(mem: &mut [u8], write_to: usize, addr: usize) {
 			let loc = &mut mem[write_to..][..USIZE_LEN];
@@ -290,17 +316,17 @@ impl MachHook {
 			loc.copy_from_slice(&ptr);
 		}
 
-        for (write_to, data) in relocs {
+		for (write_to, data) in relocs {
 			write_addr_to(hook.mmap.as_mut(), write_to, data);
-        }
+		}
 
 		// based on `processExportNode` in
 		// https://opensource.apple.com/source/ld64/ld64-264.3.102/src/abstraction/MachOTrie.hpp.auto.html
-		let (edit_offset, edit_size) = commands.iter()
+		let edit_data = hook.commands.iter()
 			.find_map(|cmd| match &cmd.0 {
 				LoadCommand::DyldExportsTrie(data) => Some((data.off as usize, data.size as usize)),
 				_ => None
-			}).unwrap();
+			});
 
 		fn process_export_node(mut offset: usize, data: &[u8], cumulative: &mut String) -> Vec<TrieData> {
 			let mut parent_entry = None;
@@ -375,14 +401,208 @@ impl MachHook {
 			child_vec
 		}
 
-		if edit_size > 0 {
-			let trie_data = &hook.mmap.as_ref()[edit_offset..][..edit_size];
-			let mut cumulative = String::new();
-			let tries = process_export_node(0, trie_data, &mut cumulative);
+		if let Some((edit_offset, edit_size)) = edit_data {
+			if edit_size > 0 {
+				let trie_data = &hook.mmap.as_ref()[edit_offset..][..edit_size];
+				let mut cumulative = String::new();
+				let tries = process_export_node(0, trie_data, &mut cumulative);
 
-			println!("tries: {tries:?}");
+				println!("tries: {tries:?}");
+			} else {
+				println!("edit_size is {edit_size}, nothing to process");
+			}
 		} else {
-			println!("edit_size is {edit_size}, nothing to process");
+			println!("No export info");
+		}
+
+		let dyld_info = hook.commands.iter()
+			.find_map(|cmd| match &cmd.0 {
+				LoadCommand::DyldInfo { bind_off, bind_size, export_off, export_size, .. } =>
+					Some((bind_off, bind_size, export_off, export_size)),
+				_ => None,
+			});
+
+
+		if let Some((bind_off, bind_size, ..)) = dyld_info {
+			let mut cur_seg_idx = 0;
+			let mut cur_offset = 0;
+			let mut cur_library_ordinal = 0;
+			let mut cur_addend = 0;
+			let mut cur_trailing_flags = 0;
+			let mut cur_name = std::borrow::Cow::Borrowed("");
+			let mut cur_type = 0;
+			let mut idx = 0;
+
+			let bind_data = &hook.mmap.as_ref()[*bind_off as usize..][..*bind_size as usize];
+
+			while idx < *bind_size as usize {
+				let instr = bind_data[idx];
+				idx += 1;
+
+				match instr & 0xf0 {
+					// DONE
+					0x00 => continue,
+					// SET_DYLIB_ORDINAL_IMM
+					0x10 => cur_library_ordinal = (instr & 0x0f) as isize,
+					// SET_DYLIB_ORDINAL_ULEB
+					0x20 => {
+						let (ordinal, increase) = MachHook::read_uleb128(&bind_data[idx..]);
+						cur_library_ordinal = ordinal as isize;
+						idx += increase;
+					},
+					// SET_DYLIB_SPECIAL_IMM
+					0x30 => cur_library_ordinal = -((instr & 0x0f) as isize),
+					// SET_SYMBOL_TRAILING_FLAGS_IMM
+					0x40 => {
+						cur_trailing_flags = instr & 0x0f;
+						cur_name = String::from_utf8_lossy(
+							bind_data[idx..].split(|x| *x == 0).next().unwrap()
+						);
+						idx += cur_name.len() + 1;
+					},
+					// SET_TYPE_IMM
+					0x50 => cur_type = instr & 0x0f,
+					// SET_ADDEND_SLEB
+					0x60 => {
+						let (addend, increase) = MachHook::read_sleb128(&bind_data[idx..]);
+						cur_addend = addend;
+						idx += increase;
+					},
+					// SET_SEGMENT_AND_OFFSET_ULEB
+					0x70 => {
+						cur_seg_idx = instr & 0x0f;
+						let (offset, increase) = MachHook::read_uleb128(&bind_data[idx..]);
+						cur_offset = offset;
+						idx += increase;
+					},
+					// ADD_ADDR_ULEB
+					0x80 => {
+						let (offset, increase) = MachHook::read_uleb128(&bind_data[idx..]);
+						cur_offset = cur_offset.wrapping_add(offset);
+						idx += increase;
+					}
+					// DO_BIND, DO_BIND_ADD_ADDR_ULEB, DO_BIND_ADD_ADDR_IMM_SCALED
+					0x90 | 0xa0 | 0xb0 => {
+						let Some(seg_file_off) = hook.commands.iter()
+							.filter_map(|cmd| match cmd.0 {
+								LoadCommand::Segment { fileoff, .. }
+								| LoadCommand::Segment64 { fileoff, .. } => Some(fileoff),
+								_ => None
+							})
+							.nth(cur_seg_idx as usize) else {
+								println!("Invalid segment index {} for binding '{}'", cur_seg_idx, cur_name);
+								continue;
+							};
+
+						hook.bindings.push(Binding {
+							file_offset: seg_file_off + cur_offset,
+							library_ordinal: cur_library_ordinal,
+							addend: cur_addend,
+							trailing_flags: cur_trailing_flags,
+							sym_type: cur_type,
+							sym_name: cur_name.to_string()
+						});
+						cur_offset += USIZE_LEN;
+
+						if instr >= 0xb0 {
+							// should this be times USIZE_LEN instead? Or just * 4?
+							cur_offset += (instr & 0x0f) as usize * USIZE_LEN;
+						} else if instr >= 0xa0 {
+							let (offset, increase) = MachHook::read_uleb128(&bind_data[idx..]);
+							cur_offset += offset;
+							idx += increase;
+						}
+					},
+					// DO_BIND_ULEB_TIMES_SKIPPING_ULEB
+					0xc0 => {
+						let (sym_count, increase) = MachHook::read_uleb128(&bind_data[idx..]);
+						idx += increase;
+						let (bytes_skip, increase) = MachHook::read_uleb128(&bind_data[idx..]);
+						idx += increase;
+
+						let Some(seg_file_off) = hook.commands.iter()
+							.filter_map(|cmd| match cmd.0 {
+								LoadCommand::Segment { fileoff, .. }
+								| LoadCommand::Segment64 { fileoff, .. } => Some(fileoff),
+								_ => None
+							})
+							.nth(cur_seg_idx as usize) else {
+								println!("Invalid segment index {} for binding '{}'", cur_seg_idx, cur_name);
+								continue;
+							};
+
+						for _ in 0..sym_count {
+							hook.bindings.push(Binding {
+								file_offset: seg_file_off + cur_offset,
+								library_ordinal: cur_library_ordinal,
+								addend: cur_addend,
+								trailing_flags: cur_trailing_flags,
+								sym_type: cur_type,
+								sym_name: cur_name.to_string()
+							});
+							cur_offset += USIZE_LEN + bytes_skip;
+						}
+					},
+					_ => println!("Cannot handle instr {instr:x} at {idx:x}"),
+				}
+			}
+		}
+
+		for binding in &hook.bindings {
+			if binding.sym_type != 1 {
+				println!("sym_type for '{}' is {}, don't know how to handle", binding.sym_name, binding.sym_type);
+				continue;
+			}
+
+			macro_rules! cntn{
+				($err:expr$(, $arg:expr)*) => {
+					println!($err$(, $arg)*);
+					continue;
+				}
+			}
+
+			let sym_addr = match binding.library_ordinal {
+				// SELF | MAIN_EXECUTABLE
+				// I don't get what the difference is
+				0 | -1 => {
+					let Some(ptr) = hook.get_symbol_ptr(binding.sym_name.as_str()) else {
+						cntn!("Can't get ptr to symbol '{}' in ordinal {}", binding.sym_name, binding.library_ordinal);
+					};
+
+					ptr as usize
+				},
+				-2 | 1.. => {
+					// normally, a value from 1.. means that it's from an external library with the
+					// ordinal given, but sometimes they're libc functions, so we just check to see
+					// if it's loaded in just in case
+					let Ok(c_name) = std::ffi::CString::new(&binding.sym_name[1..]) else {
+						cntn!("Name '{}' has null character in it, can't dlsym", binding.sym_name);
+					};
+					unsafe { libc::dlsym(handle, c_name.as_ptr()) as *const () as usize }
+				},
+				_ => {
+					cntn!("Invalid library_ordinal ({}) for '{}'", binding.library_ordinal, binding.sym_name);
+				}
+			};
+
+			let write_to = binding.file_offset;
+
+			if sym_addr == 0 {
+				cntn!("Got null ptr for {} with ordinal {} (should've been written to {write_to:x}, addend {})", &binding.sym_name[1..], binding.library_ordinal, binding.addend);
+			}
+
+			println!("Successfully bound {} ({sym_addr:x} at {write_to:x})", binding.sym_name);
+
+			// I don't know how to handle the addend and trailing flags, so we're just ignoring
+			// that for now
+			write_addr_to(hook.mmap.as_mut(), write_to, sym_addr);
+		}
+
+		if let Some((.., export_off, export_size)) = dyld_info {
+			let export_data = &hook.mmap.as_ref()[*export_off as usize..][..*export_size as usize];
+			let mut trie_str = String::new();
+			let tries = process_export_node(0, export_data, &mut trie_str);
+			println!("tries from dyld_info export info: {tries:?}");
 		}
 
 		// Now we need to go through every address in __DATA/__const and relocate it to the current
@@ -466,13 +686,12 @@ impl MachHook {
 					// length as a number of ptrs
 					0x00 => length,
 					_ => {
-						eprintln!("Don't know how to handle reloc case where flags is {flags:x} and length is {length:x} at idx {ptr_sec_start:x}");
+						println!("Don't know how to handle reloc case where flags is {flags:x} and length is {length:x} at idx {ptr_sec_start:x}");
 						// we need to return some here so that it doesn't stop iterating
 						return Some(vec![]);
 					}
 				};
 
-				println!("{ptr_sec_start:x} += {:x}, flags: {flags:x}, length: {length:x}", total_size * USIZE_LEN);
 				let res = (0..total_size).map(|off| const_start + idx + (off * USIZE_LEN)).collect();
 				idx += total_size * USIZE_LEN;
 				Some(res)
@@ -513,7 +732,7 @@ impl MachHook {
 
 			let Some(sec) = hook.sections.iter()
 				.find(|sec| ptr > sec.addr && ptr < sec.addr + sec.size) else {
-					eprintln!("Couldn't find section to fit ptr at {ptr:x}");
+					println!("Couldn't find section to fit ptr at {ptr:x}");
 					continue;
 				};
 
@@ -536,25 +755,38 @@ impl MachHook {
 		}
 
 		#[cfg(target_arch = "x86_64")]
-        unsafe {
-            region::protect(mmap_start, size, region::Protection::READ_WRITE_EXECUTE).unwrap();
-        }
+		unsafe {
+			region::protect(mmap_start, size, region::Protection::READ_WRITE_EXECUTE).unwrap();
+		}
 
-        Ok(hook)
-    }
+		Ok(hook)
+	}
 
-    pub fn get_symbol_ptr(&self, symbol_name: &str) -> Option<*const ()> {
-        // symbols should be resolved with offsets added in at this point
-        symbols!(symbols, self);
+	pub fn get_symbol_ptr(&self, symbol_name: &str) -> Option<*const ()> {
+		// symbols should be resolved with offsets added in at this point
+		symbols!(symbols, self);
 
-        symbols.find(|s| s.name() == Some(symbol_name))
-            .and_then(|sym| match sym {
-                Symbol::Absolute { entry, .. } | Symbol::Defined { entry, .. } => Some(entry as *const ()),
-                Symbol::Undefined { .. } | Symbol::Prebound { .. } => None,
-                Symbol::Indirect { symbol, .. } => symbol.and_then(|s| self.get_symbol_ptr(s)),
-                Symbol::Debug { addr, .. } => Some(addr as *const ())
-            })
-    }
+		symbols.find(|s| s.name() == Some(symbol_name))
+			.and_then(|sym| match sym {
+				Symbol::Absolute { entry, .. } | Symbol::Defined { entry, .. } => Some(entry as *const ()),
+				Symbol::Undefined { .. } | Symbol::Prebound { .. } => None,
+				Symbol::Indirect { symbol, .. } => symbol.and_then(|s| self.get_symbol_ptr(s)),
+				Symbol::Debug { addr, .. } => Some(addr as *const ())
+			})
+			// If we can't find it in the symbol table, try to pull it out of our binding map
+			.or_else(||
+				self.bindings.iter()
+					.filter(|b| b.sym_name == symbol_name)
+					.map(|b| {
+						let ptr_bytes = &self.mmap.as_ref()[b.file_offset..][..USIZE_LEN];
+						let ptr = usize::from_le_bytes(ptr_bytes.try_into().unwrap());
+						(ptr as isize).saturating_sub(b.addend)
+					})
+					.filter(|&ptr| ptr != 0)
+					.next()
+					.map(|p| p as *const ())
+			)
+	}
 
 	// uhhh if you are using a library extracted from dyld, these won't work. They're weird. I'll
 	// figure it out later
@@ -684,112 +916,139 @@ impl MachHook {
 		Some(usize::from_le_bytes(chunk))
 	}
 
-    // substitution must be a pointer to a sysv64 calling convention function
-    pub fn hook_fn<'s>(
-        &mut self, symbol_name: &'s str, substitution: *const ()
-    ) -> Result<*const (), SymbolNotFound<'s>> {
-        symbols!(symbols, self);
+	// substitution must be a pointer to a sysv64 calling convention function
+	pub fn hook_fn<'s>(
+		&mut self, symbol_name: &'s str, substitution: *const ()
+	) -> Result<*const (), SymbolNotFound<'s>> {
+		symbols!(symbols, self);
 
-        let symbol = symbols.position(|s| s.name() == Some(symbol_name))
-            .ok_or(SymbolNotFound(symbol_name))?;
+		let mut ret = Err(SymbolNotFound(symbol_name));
 
-        let is_64bit = self.header.is_64bit();
-        let sym_size = if is_64bit { 16 } else { 12 };
-        let start = self.symoff as usize + (symbol * sym_size);
-        let sym_data = &mut self.mmap.as_mut()[start..start + sym_size];
+		if let Some(symbol) = symbols.position(|s| s.name() == Some(symbol_name)) {
 
-        let flags = sym_data[4];
-        const N_TYPE: u8 = 0x03;
-        const N_ABS: u8 = 0x2;
+			let is_64bit = self.header.is_64bit();
+			let sym_size = if is_64bit { 16 } else { 12 };
+			let start = self.sym_info.symoff as usize + (symbol * sym_size);
+			let sym_data = &mut self.mmap.as_mut()[start..start + sym_size];
 
-        // Make it an absolute symbol
-        sym_data[4] = (flags & !N_TYPE) | N_ABS;
+			let flags = sym_data[4];
+			const N_TYPE: u8 = 0x03;
+			const N_ABS: u8 = 0x2;
 
-        // Overwrite the 'value' of the symbol to make it the address of the intended function
-		let ret = usize::from_le_bytes(sym_data[8..].try_into().unwrap()) as *const ();
-		let ptr = (substitution as usize).to_le_bytes();
-		sym_data[8..].copy_from_slice(&ptr);
+			// Make it an absolute symbol
+			sym_data[4] = (flags & !N_TYPE) | N_ABS;
 
-        Ok(ret)
-    }
+			// Overwrite the 'value' of the symbol to make it the address of the intended function
+			ret = Ok(usize::from_le_bytes(sym_data[8..].try_into().unwrap()) as *const ());
+			let ptr = (substitution as usize).to_le_bytes();
+			sym_data[8..].copy_from_slice(&ptr);
+		}
 
-    #[sysv64]
-    pub unsafe fn dlopen(name: *const libc::c_char) -> *mut libc::c_void {
-        #[cfg_attr(not(target_family = "windows"), allow(unused_mut))]
-        let mut path_str = std::ffi::CStr::from_ptr(name).to_str().unwrap();
+		for bind in self.bindings.iter().filter(|b| b.sym_name == symbol_name) {
+			let real_addr = ((substitution as isize) + bind.addend) as usize;
+			self.mmap[bind.file_offset..][..USIZE_LEN].copy_from_slice(&real_addr.to_le_bytes());
 
-        let _path: String;
-        #[cfg(target_family = "windows")]
-        {
-            _path = path_str.chars()
-                .map(|x| match x {
-                    '\\' => '/',
-                    c => c
-                }).collect::<String>();
+			ret = Ok(bind.file_offset as *const ());
+		}
 
-            path_str = _path.as_str();
-        }
+		ret
+	}
 
-        match MachHook::new(path_str, None) {
-            Ok(lib) => Box::into_raw(Box::new(lib)) as *mut libc::c_void,
-            Err(_) => std::ptr::null_mut(),
-        }
-    }
+	#[sysv64]
+	pub unsafe fn dlopen(name: *const libc::c_char) -> *mut libc::c_void {
+		#[cfg_attr(not(target_family = "windows"), allow(unused_mut))]
+		let mut path_str = std::ffi::CStr::from_ptr(name).to_str().unwrap();
 
-    #[sysv64]
-    pub unsafe fn dlsym(hook: *mut MachHook, symbol: *const libc::c_char) -> *mut libc::c_void {
-        let symbol = std::ffi::CStr::from_ptr(symbol).to_str().unwrap();
-        match hook.as_ref().and_then(|lib| lib.get_symbol_ptr(symbol)) {
-            Some(func) => func as *mut libc::c_void,
-            None => std::ptr::null_mut(),
-        }
-    }
+		let _path: String;
+		#[cfg(target_family = "windows")]
+		{
+			_path = path_str.chars()
+				.map(|x| match x {
+					'\\' => '/',
+					c => c
+				}).collect::<String>();
 
-    #[sysv64]
-    pub unsafe fn dlclose(library: *mut MachHook) {
-        let _ = Box::from_raw(library);
-    }
+			path_str = _path.as_str();
+		}
+
+		match MachHook::new(path_str, None) {
+			Ok(lib) => Box::into_raw(Box::new(lib)) as *mut libc::c_void,
+			Err(_) => std::ptr::null_mut(),
+		}
+	}
+
+	#[sysv64]
+	pub unsafe fn dlsym(hook: *mut MachHook, symbol: *const libc::c_char) -> *mut libc::c_void {
+		let symbol = std::ffi::CStr::from_ptr(symbol).to_str().unwrap();
+		match hook.as_ref().and_then(|lib| lib.get_symbol_ptr(symbol)) {
+			Some(func) => func as *mut libc::c_void,
+			None => std::ptr::null_mut(),
+		}
+	}
+
+	#[sysv64]
+	pub unsafe fn dlclose(library: *mut MachHook) {
+		let _ = Box::from_raw(library);
+	}
 
 	// https://opensource.apple.com/source/dyld/dyld-195.6/src/ImageLoaderMachOCompressed.cpp.auto.html
-	// I don't think it's the same as usize::from_le_bytes() since it seems to ignore the sign
-	// bit on each byte but who knows
 	pub fn read_uleb128(data: &[u8]) -> (usize, usize) {
 		data.iter()
 			.take(9)
+			.take_while(|&byte| byte & 0x80 != 0)
+			// then we chain the last element which doesn't have the continuation bit but is still
+			// within the bounds of the uleb
+			.chain(data.iter().take(10).find(|b| **b < 0x80))
 			.enumerate()
-			.take_while(|(idx, &byte)| *idx == 0 || byte & 0x80 != 0)
 			.fold((0, 0), |(res, _), (bit, &byte)|
 				  (res | ((byte as usize & 0x7f) << (bit * 7)), bit + 1)
 			)
 	}
+
+	pub fn read_sleb128(data: &[u8]) -> (isize, usize) {
+		let (ures, increase) = Self::read_uleb128(data);
+		let mut res = ures as isize;
+		let shift = increase * 7;
+		if res & 1 << (shift - 1) != 0 {
+			res |= !0 << shift;
+		}
+		(res, increase)
+	}
+}
+
+pub extern "C" fn nsversion_of_run_time_library(_lib: *const libc::c_char) -> i32 {
+	// maybe?
+	0x4e40000
 }
 
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 pub extern "C" fn noop_stub() -> i32 {
-    0
+	0
 }
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub extern "C" fn noop_stub() -> i32 {
-    0
+	0
 }
 
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 pub extern "C" fn set_android_id_stub(_id: *const u8, _length: u32) -> i32 {
-    0
+	0
 }
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub extern "C" fn set_android_id_stub(_id: *const u8, _length: u32) -> i32 {
-    0
+	0
 }
 
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 pub extern "C" fn set_android_prov_path_stub(_path: *const u8) -> i32 {
-    0
+	0
 }
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub extern "sysv64" fn set_android_prov_path_stub(_path: *const u8) -> i32 {
-    0
+	0
 }
+
+
