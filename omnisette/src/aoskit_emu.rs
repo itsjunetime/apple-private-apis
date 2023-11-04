@@ -3,6 +3,7 @@ use std::{
 	rc::Rc,
 	os::unix::fs::MetadataExt,
 	path::Path,
+	ffi::{CString, CStr}
 };
 use mach_object::{
 	Symbol, SymbolIter, MachHeader, Section, LoadCommand, OFile,
@@ -230,7 +231,7 @@ impl MachHook {
 				let Some(name) = name else {
 					return None;
 				};
-				let c_name = std::ffi::CString::new(&name[1..]).unwrap();
+				let c_name = CString::new(&name[1..]).unwrap();
 				let ptr = unsafe { libc::dlsym(handle, c_name.as_ptr()) };
 				if ptr.is_null() {
 					None
@@ -575,7 +576,7 @@ impl MachHook {
 					// normally, a value from 1.. means that it's from an external library with the
 					// ordinal given, but sometimes they're libc functions, so we just check to see
 					// if it's loaded in just in case
-					let Ok(c_name) = std::ffi::CString::new(&binding.sym_name[1..]) else {
+					let Ok(c_name) = CString::new(&binding.sym_name[1..]) else {
 						cntn!("Name '{}' has null character in it, can't dlsym", binding.sym_name);
 					};
 					unsafe { libc::dlsym(handle, c_name.as_ptr()) as *const () as usize }
@@ -726,13 +727,13 @@ impl MachHook {
 			if USIZE_LEN == 8 {
 				// clear out the top 16 bits 'cause they're only used for pac stuff and can make
 				// stuff confusing when we're just working with raw pointers
-				ptr &= (!0xffff) << 48;
+				ptr &= 0x0000ffffffffffffusize;
 			}
 			if ptr == 0 { continue; }
 
 			let Some(sec) = hook.sections.iter()
 				.find(|sec| ptr > sec.addr && ptr < sec.addr + sec.size) else {
-					println!("Couldn't find section to fit ptr at {ptr:x}");
+					// println!("Couldn't find section to fit ptr at {ptr:x}");
 					continue;
 				};
 
@@ -750,7 +751,7 @@ impl MachHook {
 		#[cfg(target_arch = "x86_64")]
 		{
 			let noop_loc = noop_stub as usize;
-			println!("writing {noop_loc} to 0x116d08");
+			println!("writing {noop_loc:x} to 0x116d08");
 			write_addr_to(hook.mmap.as_mut(), 0x116d08, noop_loc + 2);
 		}
 
@@ -758,6 +759,8 @@ impl MachHook {
 		unsafe {
 			region::protect(mmap_start, size, region::Protection::READ_WRITE_EXECUTE).unwrap();
 		}
+
+		println!("mmap start: {:?}", hook.mmap.as_ptr());
 
 		Ok(hook)
 	}
@@ -792,7 +795,7 @@ impl MachHook {
 	// figure it out later
 	pub fn get_objc_method_ptr(&self, class: &str, method: &str) -> Option<*const ()> {
 		fn string_at_ptr_eq(mem: &[u8], ptr: usize, s: &str) -> bool {
-			let Ok(Ok(cstr)) = std::ffi::CStr::from_bytes_until_nul(&mem[ptr..]).map(|cstr| cstr.to_str()) else {
+			let Ok(Ok(cstr)) = CStr::from_bytes_until_nul(&mem[ptr..]).map(|cstr| cstr.to_str()) else {
 				return false;
 			};
 			cstr == s
@@ -942,6 +945,8 @@ impl MachHook {
 			ret = Ok(usize::from_le_bytes(sym_data[8..].try_into().unwrap()) as *const ());
 			let ptr = (substitution as usize).to_le_bytes();
 			sym_data[8..].copy_from_slice(&ptr);
+
+			println!("overwrote symbol information for {symbol_name} at idx {symbol} to {substitution:?}");
 		}
 
 		for bind in self.bindings.iter().filter(|b| b.sym_name == symbol_name) {
@@ -949,6 +954,8 @@ impl MachHook {
 			self.mmap[bind.file_offset..][..USIZE_LEN].copy_from_slice(&real_addr.to_le_bytes());
 
 			ret = Ok(bind.file_offset as *const ());
+
+			println!("overwrote pointer to {symbol_name} at offset {:x} (addr {:x}) to {:x}", bind.file_offset, self.mmap.as_ptr() as usize + bind.file_offset, real_addr);
 		}
 
 		ret
@@ -957,7 +964,7 @@ impl MachHook {
 	#[sysv64]
 	pub unsafe fn dlopen(name: *const libc::c_char) -> *mut libc::c_void {
 		#[cfg_attr(not(target_family = "windows"), allow(unused_mut))]
-		let mut path_str = std::ffi::CStr::from_ptr(name).to_str().unwrap();
+		let mut path_str = CStr::from_ptr(name).to_str().unwrap();
 
 		let _path: String;
 		#[cfg(target_family = "windows")]
@@ -979,7 +986,7 @@ impl MachHook {
 
 	#[sysv64]
 	pub unsafe fn dlsym(hook: *mut MachHook, symbol: *const libc::c_char) -> *mut libc::c_void {
-		let symbol = std::ffi::CStr::from_ptr(symbol).to_str().unwrap();
+		let symbol = CStr::from_ptr(symbol).to_str().unwrap();
 		match hook.as_ref().and_then(|lib| lib.get_symbol_ptr(symbol)) {
 			Some(func) => func as *mut libc::c_void,
 			None => std::ptr::null_mut(),
@@ -1016,13 +1023,21 @@ impl MachHook {
 	}
 }
 
+pub static NDR_RECORD: usize = 0x100000000;
+
 pub extern "C" fn nsversion_of_run_time_library(_lib: *const libc::c_char) -> i32 {
 	// maybe?
 	0x4e40000
 }
 
+pub extern "C" fn mach_msg_stub(_msg: *const libc::c_void, _option: i32, _send_size: i32, _rcv_size: i32, _rcv_name: i32, _timeout: i32, _notify: i32) -> i32 {
+	0
+}
+
+pub extern "C" fn noop_stub() {}
+
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
-pub extern "C" fn noop_stub() -> i32 {
+pub extern "C" fn noop_ret_0() -> i32 {
 	0
 }
 

@@ -6,9 +6,9 @@ mod posix_windows;
 use crate::{
     adi_proxy::{
         ADIError, ADIProxy, ConfigurableADIProxy, RequestOTPData, StartProvisioningData,
-        SynchronizeData,
+        SynchronizeData
     },
-    aoskit_emu::{MachHook, set_android_id_stub, set_android_prov_path_stub}
+    aoskit_emu::*
 };
 
 use android_loader::android_library::AndroidLibrary;
@@ -184,8 +184,12 @@ impl StoreServicesCoreADIProxy {
 		hook.hook_fn("_dlsym", MachHook::dlsym as *const ())?;
 		// I think this may need to be replaced with __sl_dlopen?
 		hook.hook_fn("_dlopen", MachHook::dlopen as *const ())?;
-		hook.hook_fn("___stack_chk_guard", crate::aoskit_emu::noop_stub as *const ())?;
-		hook.hook_fn("_NSVersionOfRunTimeLibrary", crate::aoskit_emu::nsversion_of_run_time_library as *const ())?;
+		hook.hook_fn("___stack_chk_guard", noop_ret_0 as *const ())?;
+		hook.hook_fn("_NSVersionOfRunTimeLibrary", nsversion_of_run_time_library as *const ())?;
+		hook.hook_fn("_NDR_record", std::ptr::addr_of!(NDR_RECORD) as *const ())?;
+		hook.hook_fn("_mig_get_reply_port", noop_ret_0 as *const ())?;
+		hook.hook_fn("_mach_msg", mach_msg_stub as *const ())?;
+		hook.hook_fn("_mig_put_reply_port", noop_stub as *const ())?;
 
         // The symbols that may not be present, so we're ok if trying to replace them returns an error
 		_ = hook.hook_fn("_close", libc::close as *const ());
@@ -204,20 +208,6 @@ impl StoreServicesCoreADIProxy {
         _ = hook.hook_fn("___errno", __errno_location as *const ());
         _ = hook.hook_fn("_dlclose", MachHook::dlclose as *const ());
 
-		/*let adi_provisioning_erase = hook.get_objc_method_ptr("AKADIProxy", "eraseProvisioningForDSID:").unwrap();
-        let adi_synchronize = hook.get_objc_method_ptr("AKADIProxy", "synchronizeWithDSID:SIM:SIMLength:outMID:outMIDLength:outSRM:outSRMLength:").unwrap();
-        let adi_provisioning_destroy = hook.get_objc_method_ptr("AKADIProxy", "destroyProvisioningSession:").unwrap();
-        let adi_provisioning_end = hook.get_objc_method_ptr("AKADIProxy", "endProvisioningWithSession:PTM:PTMLength:TK:TKLength:").unwrap();
-        let adi_provisioning_start = hook.get_objc_method_ptr("AKADIProxy", "startProvisioningWithDSID:SPIM:SPIMLength:outCPIM:outCPIMLength:outSession:").unwrap();
-		// hmmmm ok so this one (or what I think is this one), on akd, takes two args: a pointer to
-		// write the data at, and the dsid to process. So uh. Dunno what to do about that exactly,
-		// we'll figure it out later.
-		// maybe we just do a stub? hmmmm. It just seems to return 0x2020600 if we pass in -2,
-		// which we will, so yeah probably stub it out
-        // let adi_get_login_code = hook.get_symbol_ptr("+[AKADIProxy getIDMSRoutingInfo:forDSID:").unwrap();
-		let adi_get_login_code = crate::aoskit_emu::get_login_code;
-        let adi_dispose = hook.get_objc_method_ptr("AKADIProxy", "dispose:").unwrap();
-        let adi_otp_request = hook.get_objc_method_ptr("AKADIProxy", "requestOTPForDSID:outMID:outMIDSize:outOTP:outOTPSize:").unwrap();*/
         let adi_provisioning_erase = hook
             .get_symbol_ptr("_p435tmhbla")
             .ok_or(ADIStoreSericesCoreErr::InvalidLibraryFormat)?;
@@ -538,23 +528,51 @@ impl std::error::Error for ADIStoreSericesCoreErr {}
 
 #[cfg(test)]
 mod tests {
-    use crate::{AnisetteConfiguration, AnisetteHeaders};
+    use crate::{
+        AnisetteConfiguration,
+        adi_proxy::{ADIProxyAnisetteProvider, ConfigurableADIProxy},
+        store_services_core::StoreServicesCoreADIProxy,
+        anisette_headers_provider::AnisetteHeadersProvider
+    };
     use anyhow::Result;
-    use log::info;
+    use log::{info, LevelFilter};
     use std::path::PathBuf;
+    use simplelog::{ColorChoice, ConfigBuilder, TermLogger, TerminalMode};
+
+    fn get_provider() -> Result<ADIProxyAnisetteProvider<StoreServicesCoreADIProxy>> {
+        let configuration = AnisetteConfiguration::new()
+            .set_configuration_path(PathBuf::new().join("anisette_test"));
+        let mut ssc_adi_proxy = StoreServicesCoreADIProxy::new(
+            configuration.configuration_path(),
+        )?;
+        let config_path = configuration.configuration_path();
+        ssc_adi_proxy.set_provisioning_path(config_path.to_str().ok_or(
+            crate::AnisetteMetaError::InvalidArgument("configuration.configuration_path".to_string()),
+        )?)?;
+        Ok(ADIProxyAnisetteProvider::new(ssc_adi_proxy, config_path.to_path_buf())?)
+    }
+
+    pub fn init_logger() {
+        _ = TermLogger::init(
+            LevelFilter::Trace,
+            ConfigBuilder::new()
+                .set_target_level(LevelFilter::Error)
+                .add_filter_allow_str("omnisette")
+                .build(),
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        );
+    }
 
     #[cfg(not(feature = "async"))]
     #[test]
     fn fetch_anisette_ssc() -> Result<()> {
-        crate::tests::init_logger();
+        init_logger();
 
-        let mut provider = AnisetteHeaders::get_ssc_anisette_headers_provider(
-            AnisetteConfiguration::new()
-                .set_configuration_path(PathBuf::new().join("anisette_test")),
-        )?;
+        let mut provider = get_provider()?;
         info!(
             "Headers: {:?}",
-            provider.provider.get_authentication_headers()?
+            provider.get_authentication_headers()?
         );
         Ok(())
     }
@@ -562,15 +580,12 @@ mod tests {
     #[cfg(feature = "async")]
     #[tokio::test]
     async fn fetch_anisette_ssc_async() -> Result<()> {
-        crate::tests::init_logger();
+        init_logger();
 
-        let mut provider = AnisetteHeaders::get_ssc_anisette_headers_provider(
-            AnisetteConfiguration::new()
-                .set_configuration_path(PathBuf::new().join("anisette_test")),
-        )?;
+        let mut provider = get_provider()?;
         info!(
             "Headers: {:?}",
-            provider.provider.get_authentication_headers().await?
+            provider.get_authentication_headers().await?
         );
         Ok(())
     }
