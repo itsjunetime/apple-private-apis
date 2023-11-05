@@ -190,6 +190,7 @@ impl StoreServicesCoreADIProxy {
 		hook.hook_fn("_mig_get_reply_port", noop_ret_0 as *const ())?;
 		hook.hook_fn("_mach_msg", mach_msg_stub as *const ())?;
 		hook.hook_fn("_mig_put_reply_port", noop_stub as *const ())?;
+		hook.hook_fn("_objc_end_catch", noop_stub as *const ())?;
 
         // The symbols that may not be present, so we're ok if trying to replace them returns an error
 		_ = hook.hook_fn("_close", libc::close as *const ());

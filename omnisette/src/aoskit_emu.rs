@@ -186,14 +186,6 @@ impl MachHook {
 				_ => None
 			}).ok_or_else(|| NewMachHookErr::NoSymtabInFile)?;
 
-		// shouldn't this be pulled from __PAGEZERO specifically?
-		let load_addr = commands.iter()
-			.find_map(|cmd| match cmd.0 {
-				LoadCommand::Segment { vmaddr, .. }
-				| LoadCommand::Segment64 { vmaddr, .. } => Some(vmaddr),
-				_ => None
-			}).unwrap();
-
 		let sections: Vec<Rc<Section>> = commands
 			.iter()
 			.filter_map(|cmd| match cmd.0 {
@@ -218,12 +210,45 @@ impl MachHook {
 			}
 		};
 
+		hook.relocate_symbols();
+
+		// now we gotta resolve indirect symbols
+		hook.resolve_indirects()?;
+
+		// hook.check_export_info();
+
+		hook.rebind();
+
+		hook.do_const_relocs();
+
+		// time to cheat!
+		// At 0x116d08, there should be a reference to a subroutine that checks the OS version.
+		// We just want to hijack that reference to make it work
+
+		#[cfg(target_arch = "x86_64")]
+		{
+			let noop_loc = noop_stub as usize;
+			println!("writing {noop_loc:x} to 0x116d08");
+			hook.write_ptr_to(0x116d08, noop_loc + 2);
+		}
+
+		#[cfg(target_arch = "x86_64")]
+		unsafe {
+			region::protect(mmap_start, size, region::Protection::READ_WRITE_EXECUTE).unwrap();
+		}
+
+		println!("mmap start: {:?}", mmap_start);
+
+		Ok(hook)
+	}
+
+	fn relocate_symbols(&mut self) {
 		// we need this to be signed because, since we're using images extracted from dyldex, their
 		// expected load position may be way higher than the mmap_start, so we'll need to offset the
 		// symbols back
-		let sym_offset = mmap_start as isize - load_addr as isize;
+		let sym_offset = self.mmap.as_ptr() as isize - self.load_addr() as isize;
 		println!("sym_offset: {sym_offset}");
-		symbols!(symbols, hook);
+		symbols!(symbols, self);
 
 		let handle = unsafe { libc::dlopen(std::ptr::null(), 0) };
 		let syms: Vec<_> = symbols.flat_map(|sym| match sym {
@@ -249,26 +274,27 @@ impl MachHook {
 		}).collect();
 
 		for (name, resolved_addr) in syms {
-			if let Err(e) = hook.hook_fn(&name, resolved_addr) {
+			if let Err(e) = self.hook_fn(&name, resolved_addr) {
 				println!("couldn't hook {name} to {resolved_addr:?}: {e}");
 			}
 		}
+	}
 
-		// now we gotta resolve indirect symbols
+	fn resolve_indirects(&mut self) -> Result<(), NewMachHookErr> {
 		// got bless https://github.com/opensource-apple/cctools/blob/master/otool/ofile_print.c#L7093
-		let (indirectoff, nindirect) = hook.commands.iter()
+		let (indirectoff, nindirect) = self.commands.iter()
 			.find_map(|cmd| match &cmd.0 {
 				LoadCommand::DySymTab { indirectsymoff, nindirectsyms, .. } => Some((indirectsymoff, nindirectsyms)),
 				_ => None
 			}).ok_or_else(|| NewMachHookErr::NoSymtabInFile)?;
 
-		let indirect_table = &hook.mmap.as_ref()[*indirectoff as usize..][..*nindirect as usize * 4];
-		let is_64bit = hook.header.is_64bit();
+		let indirect_table = &self.mmap.as_ref()[*indirectoff as usize..][..*nindirect as usize * 4];
+		let is_64bit = self.header.is_64bit();
 
-		symbols!(symbols, hook);
+		symbols!(symbols, self);
 		let symbols: Vec<_> = symbols.collect();
 
-		let relocs = hook.sections.iter().flat_map(|sec| {
+		let relocs = self.sections.iter().flat_map(|sec| {
 			let s_type = sec.flags.sect_type();
 			let stride = if s_type == S_SYMBOL_STUBS {
 				sec.reserved2
@@ -311,102 +337,100 @@ impl MachHook {
 		.flatten()
 		.collect::<Vec<_>>();
 
-		fn write_addr_to(mem: &mut [u8], write_to: usize, addr: usize) {
-			let loc = &mut mem[write_to..][..USIZE_LEN];
-			let ptr = addr.to_le_bytes();
-			loc.copy_from_slice(&ptr);
+		for (write_to, addr) in relocs {
+			self.write_ptr_to(write_to, addr);
 		}
 
-		for (write_to, data) in relocs {
-			write_addr_to(hook.mmap.as_mut(), write_to, data);
+		Ok(())
+	}
+
+	fn process_export_node(mut offset: usize, data: &[u8], cumulative: &mut String) -> Vec<TrieData> {
+		let mut parent_entry = None;
+		let (terminal_size, term_increase) = MachHook::read_uleb128(&data[offset..]);
+		if terminal_size != 0 {
+			offset += term_increase;
+			let mut uleb_ptr = &data[offset + term_increase..];
+
+			let name = cumulative.clone();
+			let (flags, flag_increase) = MachHook::read_uleb128(uleb_ptr);
+			uleb_ptr = &uleb_ptr[flag_increase..];
+
+			let address: usize;
+			let other: usize;
+			let import_name: Option<String>;
+
+			let (next_uleb, increase) = MachHook::read_uleb128(uleb_ptr);
+			uleb_ptr = &uleb_ptr[increase..];
+
+			if flags & EXPORT_SYMBOL_FLAGS_REEXPORT != 0 {
+				address = 0;
+				other = next_uleb;
+				import_name = uleb_ptr
+					.split(|x| *x == 0)
+					.next()
+					.map(String::from_utf8_lossy)
+					.map(std::borrow::Cow::into_owned);
+			} else {
+				address = next_uleb;
+				if flags & EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER != 0 {
+					let (uleb_other, _increase) = MachHook::read_uleb128(uleb_ptr);
+					other = uleb_other;
+					// we should increase uleb_ptr but it's never read again soooo
+					//uleb_ptr = &uleb_ptr[increase..];
+				} else {
+					other = 0;
+				}
+				import_name = None;
+			}
+
+			parent_entry = Some(TrieEntry {
+				node_offset: offset,
+				data: TrieData {
+					name,
+					flags,
+					address,
+					other,
+					import_name
+				}
+			});
 		}
 
+		let children_count = data[offset + terminal_size];
+		let mut child_vec = Vec::with_capacity(parent_entry.map_or(0, |_| 1) + children_count as usize);
+		let mut children = &data[offset + terminal_size + 1..];
+
+		child_vec.extend((0..children_count).flat_map(|_| {
+			let edge_str = children.split(|c| *c == 0)
+				.next()
+				.and_then(|s| std::str::from_utf8(s).ok())
+				.unwrap();
+			if cumulative.is_empty() {
+				cumulative.push_str(edge_str);
+			}
+			// have to increase by 1 to get the null byte
+			children = &children[edge_str.len() + 1..];
+			let (child_offset, child_increase) = MachHook::read_uleb128(children);
+			children = &children[child_increase..];
+			MachHook::process_export_node(child_offset, data, cumulative)
+		}));
+
+		child_vec
+	}
+
+	fn check_export_info(&self) {
 		// based on `processExportNode` in
 		// https://opensource.apple.com/source/ld64/ld64-264.3.102/src/abstraction/MachOTrie.hpp.auto.html
-		let edit_data = hook.commands.iter()
+		let edit_data = self.commands.iter()
 			.find_map(|cmd| match &cmd.0 {
 				LoadCommand::DyldExportsTrie(data) => Some((data.off as usize, data.size as usize)),
 				_ => None
 			});
 
-		fn process_export_node(mut offset: usize, data: &[u8], cumulative: &mut String) -> Vec<TrieData> {
-			let mut parent_entry = None;
-			let (terminal_size, term_increase) = MachHook::read_uleb128(&data[offset..]);
-			if terminal_size != 0 {
-				offset += term_increase;
-				let mut uleb_ptr = &data[offset + term_increase..];
-
-				let name = cumulative.clone();
-				let (flags, flag_increase) = MachHook::read_uleb128(uleb_ptr);
-				uleb_ptr = &uleb_ptr[flag_increase..];
-
-				let address: usize;
-				let other: usize;
-				let import_name: Option<String>;
-
-				let (next_uleb, increase) = MachHook::read_uleb128(uleb_ptr);
-				uleb_ptr = &uleb_ptr[increase..];
-
-				if flags & EXPORT_SYMBOL_FLAGS_REEXPORT != 0 {
-					address = 0;
-					other = next_uleb;
-					import_name = uleb_ptr
-						.split(|x| *x == 0)
-						.next()
-						.map(String::from_utf8_lossy)
-						.map(std::borrow::Cow::into_owned);
-				} else {
-					address = next_uleb;
-					if flags & EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER != 0 {
-						let (uleb_other, _increase) = MachHook::read_uleb128(uleb_ptr);
-						other = uleb_other;
-						// we should increase uleb_ptr but it's never read again soooo
-						//uleb_ptr = &uleb_ptr[increase..];
-					} else {
-						other = 0;
-					}
-					import_name = None;
-				}
-
-				parent_entry = Some(TrieEntry {
-					node_offset: offset,
-					data: TrieData {
-						name,
-						flags,
-						address,
-						other,
-						import_name
-					}
-				});
-			}
-
-			let children_count = data[offset + terminal_size];
-			let mut child_vec = Vec::with_capacity(parent_entry.map_or(0, |_| 1) + children_count as usize);
-			let mut children = &data[offset + terminal_size + 1..];
-
-			child_vec.extend((0..children_count).flat_map(|_| {
-				let edge_str = children.split(|c| *c == 0)
-					.next()
-					.and_then(|s| std::str::from_utf8(s).ok())
-					.unwrap();
-				if cumulative.is_empty() {
-					cumulative.push_str(edge_str);
-				}
-				// have to increase by 1 to get the null byte
-				children = &children[edge_str.len() + 1..];
-				let (child_offset, child_increase) = MachHook::read_uleb128(children);
-				children = &children[child_increase..];
-				process_export_node(child_offset, data, cumulative)
-			}));
-
-			child_vec
-		}
-
 		if let Some((edit_offset, edit_size)) = edit_data {
 			if edit_size > 0 {
-				let trie_data = &hook.mmap.as_ref()[edit_offset..][..edit_size];
+				let trie_data = &self.mmap.as_ref()[edit_offset..][..edit_size];
 				let mut cumulative = String::new();
-				let tries = process_export_node(0, trie_data, &mut cumulative);
+				let tries = MachHook::process_export_node(0, trie_data, &mut cumulative);
 
 				println!("tries: {tries:?}");
 			} else {
@@ -415,14 +439,22 @@ impl MachHook {
 		} else {
 			println!("No export info");
 		}
+	}
 
-		let dyld_info = hook.commands.iter()
+	fn rebind(&mut self) {
+		let dyld_info = self.commands.iter()
 			.find_map(|cmd| match &cmd.0 {
 				LoadCommand::DyldInfo { bind_off, bind_size, export_off, export_size, .. } =>
 					Some((bind_off, bind_size, export_off, export_size)),
 				_ => None,
 			});
 
+		if let Some((.., export_off, export_size)) = dyld_info {
+			let export_data = &self.mmap.as_ref()[*export_off as usize..][..*export_size as usize];
+			let mut trie_str = String::new();
+			let tries = Self::process_export_node(0, export_data, &mut trie_str);
+			println!("tries from dyld_info export info: {tries:?}");
+		}
 
 		if let Some((bind_off, bind_size, ..)) = dyld_info {
 			let mut cur_seg_idx = 0;
@@ -434,7 +466,7 @@ impl MachHook {
 			let mut cur_type = 0;
 			let mut idx = 0;
 
-			let bind_data = &hook.mmap.as_ref()[*bind_off as usize..][..*bind_size as usize];
+			let bind_data = &self.mmap.as_ref()[*bind_off as usize..][..*bind_size as usize];
 
 			while idx < *bind_size as usize {
 				let instr = bind_data[idx];
@@ -484,7 +516,7 @@ impl MachHook {
 					}
 					// DO_BIND, DO_BIND_ADD_ADDR_ULEB, DO_BIND_ADD_ADDR_IMM_SCALED
 					0x90 | 0xa0 | 0xb0 => {
-						let Some(seg_file_off) = hook.commands.iter()
+						let Some(seg_file_off) = self.commands.iter()
 							.filter_map(|cmd| match cmd.0 {
 								LoadCommand::Segment { fileoff, .. }
 								| LoadCommand::Segment64 { fileoff, .. } => Some(fileoff),
@@ -495,7 +527,7 @@ impl MachHook {
 								continue;
 							};
 
-						hook.bindings.push(Binding {
+						self.bindings.push(Binding {
 							file_offset: seg_file_off + cur_offset,
 							library_ordinal: cur_library_ordinal,
 							addend: cur_addend,
@@ -521,7 +553,7 @@ impl MachHook {
 						let (bytes_skip, increase) = MachHook::read_uleb128(&bind_data[idx..]);
 						idx += increase;
 
-						let Some(seg_file_off) = hook.commands.iter()
+						let Some(seg_file_off) = self.commands.iter()
 							.filter_map(|cmd| match cmd.0 {
 								LoadCommand::Segment { fileoff, .. }
 								| LoadCommand::Segment64 { fileoff, .. } => Some(fileoff),
@@ -533,7 +565,7 @@ impl MachHook {
 							};
 
 						for _ in 0..sym_count {
-							hook.bindings.push(Binding {
+							self.bindings.push(Binding {
 								file_offset: seg_file_off + cur_offset,
 								library_ordinal: cur_library_ordinal,
 								addend: cur_addend,
@@ -549,7 +581,8 @@ impl MachHook {
 			}
 		}
 
-		for binding in &hook.bindings {
+		let handle = unsafe { libc::dlopen(std::ptr::null(), 0) };
+		for binding in &self.bindings {
 			if binding.sym_type != 1 {
 				println!("sym_type for '{}' is {}, don't know how to handle", binding.sym_name, binding.sym_type);
 				continue;
@@ -566,7 +599,7 @@ impl MachHook {
 				// SELF | MAIN_EXECUTABLE
 				// I don't get what the difference is
 				0 | -1 => {
-					let Some(ptr) = hook.get_symbol_ptr(binding.sym_name.as_str()) else {
+					let Some(ptr) = self.get_symbol_ptr(binding.sym_name.as_str()) else {
 						cntn!("Can't get ptr to symbol '{}' in ordinal {}", binding.sym_name, binding.library_ordinal);
 					};
 
@@ -596,27 +629,66 @@ impl MachHook {
 
 			// I don't know how to handle the addend and trailing flags, so we're just ignoring
 			// that for now
-			write_addr_to(hook.mmap.as_mut(), write_to, sym_addr);
+			Self::write_ptr_to_mem(self.mmap.as_mut(), write_to, sym_addr);
 		}
 
-		if let Some((.., export_off, export_size)) = dyld_info {
-			let export_data = &hook.mmap.as_ref()[*export_off as usize..][..*export_size as usize];
-			let mut trie_str = String::new();
-			let tries = process_export_node(0, export_data, &mut trie_str);
-			println!("tries from dyld_info export info: {tries:?}");
-		}
+		// there's gotta be a dysymtab; we would've failed much earlier if there wasn't
+		let indirectoff = self.commands.iter()
+			.find_map(|cmd| match cmd.0 {
+				LoadCommand::DySymTab { indirectsymoff, .. } => Some(indirectsymoff),
+				_ => None
+			}).unwrap();
 
+		symbols!(symbols, self);
+		let symbols = symbols.collect::<Vec<_>>();
+
+		let lazy_sec = self.sections.iter()
+			.find(|sec| (sec.segname == SEG_DATA || sec.segname == "__DATA_CONST") && sec.sectname == "__la_symbol_ptr");
+		if let Some(sec) = lazy_sec {
+
+			// maybe USIZE_LEN should just be 4 here?
+			for idx in 0..(sec.size / USIZE_LEN) {
+				// each one of these is an index into the indirect symbol table
+				let sym_idx_loc = indirectoff as usize + ((idx + sec.reserved1 as usize) * 4);
+				let sym_idx = u32::from_le_bytes(self.mmap.as_ref()[sym_idx_loc..][..4].try_into().unwrap());
+				// let sym_idx = (indir_sym_idx + sec.reserved1) as usize;
+				let bind_loc = sec.offset as usize + (idx * USIZE_LEN);
+
+				let Some(sym) = symbols.get(sym_idx as usize) else {
+					println!("Couldn't get sym at idx {sym_idx} (lazy at {bind_loc:x})");
+					continue;
+				};
+
+				let Some(sym_name) = sym.name() else {
+					println!("symbol at idx {sym_idx} has no name (lazy at {bind_loc:x})");
+					continue;
+				};
+
+				self.bindings.push(Binding {
+					file_offset: bind_loc,
+					addend: 0,
+					// flat_lookup ordinal
+					library_ordinal: -2,
+					trailing_flags: 0,
+					sym_type: 1,
+					sym_name: sym_name.to_owned() 
+				});
+			}
+		}
+	}
+
+	fn do_const_relocs(&mut self) {
 		// Now we need to go through every address in __DATA/__const and relocate it to the current
 		// executing address. I think. I cannot find any documentation about this anywhere so I'm
 		// just guessing
-		let mut relocs: Vec<_> = hook.sections.iter()
+		let mut relocs: Vec<_> = self.sections.iter()
 			.find(|sec| (sec.segname == SEG_DATA || sec.segname == "__DATA_CONST") && sec.sectname == "__const")
 			.map(|sec| (0..sec.size)
 				 .map(|byte| sec.offset as usize + (byte * USIZE_LEN))
 				 .collect()
 			).unwrap_or_default();
 
-		let objc_const = hook.sections.iter()
+		let objc_const = self.sections.iter()
 			.find(|sec| (sec.segname == SEG_DATA || sec.segname == "__DATA_CONST") && sec.sectname == "__objc_const");
 
 		// and then we need to go through everything in __objc_const and relocate them as an array
@@ -629,16 +701,16 @@ impl MachHook {
 			// - 0x18: Also 3 pointers, last is normally nil
 			// - 0x10: It's 2 pointers
 			// - 0x01: It's 2 pointers, normally the second one is nil? Also length is always 0,
-			//         and there's always just 1 pointer
+			//		   and there's always just 1 pointer
 			// - 0x00: who fucking knows. seems there's a length in the next u32, then the same
-			//         length stored in the next u64, and then after that the pointers start, and
-			//         most of them seem to be nil.
+			//		   length stored in the next u64, and then after that the pointers start, and
+			//		   most of them seem to be nil.
 			//
 			// if flags > 0xff, it's just a single normal pointer to relocate I think
 			// Also, maybe if the length is same as the first u64, then the length is actually 8 +
 			// flags???
 			let const_start = sec.offset as usize;
-			let const_sec = &hook.mmap.as_ref()[const_start..][..sec.size];
+			let const_sec = &self.mmap.as_ref()[const_start..][..sec.size];
 			let mut idx = 0;
 			// so. I don't understand this whole section. It just works this way, as far as I can
 			// tell in this file. Yeah
@@ -699,12 +771,12 @@ impl MachHook {
 			}).flatten());
 		}
 
-		let auth_const = hook.sections.iter()
+		let auth_const = self.sections.iter()
 			.find(|sec| sec.segname == "__AUTH_CONST" && sec.sectname == "__objc_const");
 
 		if let Some(sec) = auth_const {
 			let const_start = sec.offset as usize;
-			let sec_data = &hook.mmap.as_ref()[const_start..][..sec.size];
+			let sec_data = &self.mmap.as_ref()[const_start..][..sec.size];
 			let mut idx = 0;
 			relocs.extend(std::iter::from_fn(|| {
 				if idx >= sec.size { return None; }
@@ -722,7 +794,7 @@ impl MachHook {
 		}
 
 		for reloc_at in relocs {
-			let mut ptr = usize::from_le_bytes(hook.mmap.as_ref()[reloc_at..][..USIZE_LEN].try_into().unwrap());
+			let mut ptr = usize::from_le_bytes(self.mmap.as_ref()[reloc_at..][..USIZE_LEN].try_into().unwrap());
 
 			if USIZE_LEN == 8 {
 				// clear out the top 16 bits 'cause they're only used for pac stuff and can make
@@ -731,7 +803,7 @@ impl MachHook {
 			}
 			if ptr == 0 { continue; }
 
-			let Some(sec) = hook.sections.iter()
+			let Some(sec) = self.sections.iter()
 				.find(|sec| ptr > sec.addr && ptr < sec.addr + sec.size) else {
 					// println!("Couldn't find section to fit ptr at {ptr:x}");
 					continue;
@@ -740,29 +812,18 @@ impl MachHook {
 			// find its offset from the beginning of the section, offset that from where the
 			// section is offset from the beginning of the file, and offset that from the beginning
 			// of the memmap.
-			let real_addr = (ptr - sec.addr) + sec.offset as usize + hook.mmap.as_ptr() as usize;
-			hook.mmap.as_mut()[reloc_at..][..USIZE_LEN].copy_from_slice(&real_addr.to_le_bytes());
+			let real_addr = (ptr - sec.addr) + sec.offset as usize + self.mmap.as_ptr() as usize;
+			self.mmap.as_mut()[reloc_at..][..USIZE_LEN].copy_from_slice(&real_addr.to_le_bytes());
 		}
+	}
 
-		// time to cheat!
-		// At 0x116d08, there should be a reference to a subroutine that checks the OS version.
-		// We just want to hijack that reference to make it work
-
-		#[cfg(target_arch = "x86_64")]
-		{
-			let noop_loc = noop_stub as usize;
-			println!("writing {noop_loc:x} to 0x116d08");
-			write_addr_to(hook.mmap.as_mut(), 0x116d08, noop_loc + 2);
-		}
-
-		#[cfg(target_arch = "x86_64")]
-		unsafe {
-			region::protect(mmap_start, size, region::Protection::READ_WRITE_EXECUTE).unwrap();
-		}
-
-		println!("mmap start: {:?}", hook.mmap.as_ptr());
-
-		Ok(hook)
+	fn load_addr(&self) -> usize {
+		self.commands.iter()
+			.find_map(|cmd| match cmd.0 {
+				LoadCommand::Segment { vmaddr, .. }
+				| LoadCommand::Segment64 { vmaddr, .. } => Some(vmaddr),
+				_ => None
+			}).unwrap()
 	}
 
 	pub fn get_symbol_ptr(&self, symbol_name: &str) -> Option<*const ()> {
@@ -785,8 +846,7 @@ impl MachHook {
 						let ptr = usize::from_le_bytes(ptr_bytes.try_into().unwrap());
 						(ptr as isize).saturating_sub(b.addend)
 					})
-					.filter(|&ptr| ptr != 0)
-					.next()
+					.find(|&ptr| ptr != 0)
 					.map(|p| p as *const ())
 			)
 	}
@@ -917,6 +977,16 @@ impl MachHook {
 		}
 		let chunk = self.mmap.as_ref()[offset..][..USIZE_LEN].try_into().unwrap();
 		Some(usize::from_le_bytes(chunk))
+	}
+
+	pub fn write_ptr_to(&mut self, write_to: usize, ptr: usize) {
+		Self::write_ptr_to_mem(self.mmap.as_mut(), write_to, ptr);
+	}
+
+	fn write_ptr_to_mem(mem: &mut [u8], write_to: usize, ptr: usize) {
+		let loc = &mut mem[write_to..][..USIZE_LEN];
+		let ptr = ptr.to_le_bytes();
+		loc.copy_from_slice(&ptr);
 	}
 
 	// substitution must be a pointer to a sysv64 calling convention function
